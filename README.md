@@ -48,21 +48,29 @@ Anything not starting with `.` is run as a SQL query (a trailing `;` is optional
 ## Supported SQL
 
 ```
-SELECT  <* | col | table.col | agg(col|*) [AS alias]> , ...
+SELECT [DISTINCT] <* | expr [AS alias]> , ...
 FROM    table [alias]
 [ [INNER|LEFT] JOIN table [alias] ON <expr> ]*
 [ WHERE <expr> ]
 [ GROUP BY col , ... [ HAVING <expr> ] ]
-[ ORDER BY col [ASC|DESC] , ... ]
+[ ORDER BY <expr | position> [ASC|DESC] , ... ]
 [ LIMIT n ]
 ```
 
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` (and `COUNT(*)`).
-- Expressions: comparisons `= != < > <= >=`, boolean `AND`/`OR`, parentheses,
-  integer/float/string/`NULL` literals, and (in `HAVING`) aggregates.
+- **Aggregates**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(*)`, and
+  `COUNT(DISTINCT expr)`. Aggregate arguments can be expressions (`SUM(amount*2)`).
+- **Expressions**: arithmetic `+ - * /` (integer division on ints, like sqlite),
+  comparisons `= != < > <= >=`, `AND`/`OR`/`NOT`, `LIKE` (case-insensitive,
+  `%`/`_`), `IN (...)`, `BETWEEN a AND b`, `IS [NOT] NULL`, unary `-`, parentheses,
+  and `int`/`float`/`'string'`/`NULL` literals.
+- **Functions**: `UPPER`, `LOWER`, `LENGTH`, `ABS`, `ROUND`, `TRIM`, `COALESCE`.
+- **`SELECT DISTINCT`** and positional `ORDER BY 2`.
 - Types are inferred per column: `int`, `float`, or `string`; empty cells → `NULL`.
-- CSV: handles quoted fields, commas inside quotes, and `""` escaped quotes
-  (RFC 4180), except a quoted field containing a real newline.
+- CSV: quoted fields, commas inside quotes, `""` escapes (RFC 4180), except a
+  quoted field containing a real newline.
+
+Real-world SQL is cross-checked against `sqlite3` in `tests/stress.sh`
+(`make stress`) — every query must return the same answer sqlite does.
 
 ## How it works (the pipeline)
 
@@ -171,11 +179,12 @@ All of it lives in one file, `main.c`, in top-to-bottom dependency order:
 
 - Read-only: no `INSERT`/`UPDATE`/`DELETE`, no persistence (indexes are
   in-memory per session; a data reload drops them).
-- No `IS NULL` (use of `= NULL` is always unknown, per SQL — so it matches nothing).
-- No subqueries, `DISTINCT`, `LIKE`, arithmetic in expressions, `OFFSET`, or
-  positional `ORDER BY 1`.
+- No subqueries, `OFFSET`, `CASE`, `JOIN ... USING`, or set operations
+  (`UNION`/`INTERSECT`/`EXCEPT`).
+- `MIN`/`MAX` operate on numbers only (not lexical string min/max).
 - The planner reorders only all-INNER join chains (greedy, not exhaustive) and
   never reorders across a `LEFT JOIN`.
+- REPL/stdin only — no one-shot `-c "query" file.csv` CLI mode yet.
 
 These are natural next extensions if you want to keep going.
 

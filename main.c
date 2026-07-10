@@ -453,10 +453,12 @@ typedef enum {
     TOK_GROUP, TOK_BY, TOK_ORDER, TOK_ASC, TOK_DESC, TOK_HAVING, TOK_LIMIT,
     TOK_AND, TOK_OR, TOK_NOT, TOK_AS, TOK_NULL_KW,
     TOK_COUNT, TOK_SUM, TOK_AVG, TOK_MIN, TOK_MAX,
+    TOK_DISTINCT, TOK_LIKE, TOK_IN, TOK_BETWEEN, TOK_IS,
     /* literals / names */
     TOK_IDENT, TOK_STRING, TOK_INT, TOK_FLOAT,
     /* punctuation & operators */
     TOK_STAR, TOK_COMMA, TOK_DOT, TOK_LPAREN, TOK_RPAREN,
+    TOK_PLUS, TOK_MINUS, TOK_SLASH,
     TOK_EQ, TOK_NE, TOK_LT, TOK_GT, TOK_LE, TOK_GE,
     TOK_EOF, TOK_ERROR
 } TokenType;
@@ -483,6 +485,8 @@ static const struct { const char *kw; TokenType type; } KEYWORDS[] = {
     {"as", TOK_AS}, {"null", TOK_NULL_KW},
     {"count", TOK_COUNT}, {"sum", TOK_SUM}, {"avg", TOK_AVG},
     {"min", TOK_MIN}, {"max", TOK_MAX},
+    {"distinct", TOK_DISTINCT}, {"like", TOK_LIKE}, {"in", TOK_IN},
+    {"between", TOK_BETWEEN}, {"is", TOK_IS},
 };
 
 static int ci_equal(const char *a, const char *b) {
@@ -573,6 +577,9 @@ static TokenList tokenize(const char *sql) {
         int start = i;
         switch (c) {
             case '*': tl_push(&tl, TOK_STAR,   NULL, start); i++; break;
+            case '+': tl_push(&tl, TOK_PLUS,   NULL, start); i++; break;
+            case '-': tl_push(&tl, TOK_MINUS,  NULL, start); i++; break;
+            case '/': tl_push(&tl, TOK_SLASH,  NULL, start); i++; break;
             case ',': tl_push(&tl, TOK_COMMA,  NULL, start); i++; break;
             case '.': tl_push(&tl, TOK_DOT,    NULL, start); i++; break;
             case '(': tl_push(&tl, TOK_LPAREN, NULL, start); i++; break;
@@ -620,6 +627,9 @@ static const char *tok_name(TokenType t) {
         case TOK_MIN: return "MIN"; case TOK_MAX: return "MAX";
         case TOK_IDENT: return "ident"; case TOK_STRING: return "string";
         case TOK_INT: return "int"; case TOK_FLOAT: return "float";
+        case TOK_DISTINCT: return "DISTINCT"; case TOK_LIKE: return "LIKE";
+        case TOK_IN: return "IN"; case TOK_BETWEEN: return "BETWEEN"; case TOK_IS: return "IS";
+        case TOK_PLUS: return "+"; case TOK_MINUS: return "-"; case TOK_SLASH: return "/";
         case TOK_STAR: return "*"; case TOK_COMMA: return ","; case TOK_DOT: return ".";
         case TOK_LPAREN: return "("; case TOK_RPAREN: return ")";
         case TOK_EQ: return "="; case TOK_NE: return "!="; case TOK_LT: return "<";
@@ -638,34 +648,46 @@ static const char *tok_name(TokenType t) {
 /* A column reference, optionally qualified by a table/alias: [table.]column */
 typedef struct { char *table; char *column; } ColRef;
 
-/* --- expression tree (for WHERE / HAVING / JOIN ON) --- */
-typedef enum { EXPR_COLUMN, EXPR_LITERAL, EXPR_BINARY, EXPR_AGG } ExprKind;
+/* --- expression tree (for WHERE / HAVING / JOIN ON / SELECT items) --- */
+typedef enum {
+    EXPR_COLUMN, EXPR_LITERAL, EXPR_BINARY, EXPR_AGG,
+    EXPR_UNARY,     /* -x, NOT x                     */
+    EXPR_FUNC,      /* UPPER(x), LENGTH(x), ...      */
+    EXPR_IN,        /* x IN (a, b, c)                */
+    EXPR_ISNULL,    /* x IS [NOT] NULL               */
+    EXPR_BETWEEN    /* x BETWEEN lo AND hi           */
+} ExprKind;
 typedef struct Expr {
-    ExprKind kind;
-    ColRef   col;            /* EXPR_COLUMN, or the arg of EXPR_AGG   */
-    Value    literal;        /* EXPR_LITERAL                         */
-    TokenType op;            /* EXPR_BINARY: comparison or AND/OR    */
+    ExprKind  kind;
+    ColRef    col;           /* EXPR_COLUMN                          */
+    Value     literal;       /* EXPR_LITERAL                         */
+    TokenType op;            /* EXPR_BINARY/UNARY: operator or LIKE  */
     TokenType agg;           /* EXPR_AGG: COUNT/SUM/AVG/MIN/MAX       */
     int       agg_star;      /* EXPR_AGG: 1 for COUNT(*)             */
-    struct Expr *left, *right;
+    int       distinct;      /* EXPR_AGG: COUNT(DISTINCT x)          */
+    char     *fname;         /* EXPR_FUNC: function name             */
+    struct Expr **args;      /* EXPR_FUNC / EXPR_IN: sub-expressions */
+    size_t    nargs;
+    int       negated;       /* EXPR_IN / EXPR_ISNULL: NOT variant   */
+    struct Expr *left, *right, *lo, *hi;  /* operands (lo/hi for BETWEEN) */
 } Expr;
 
 /* --- one item in the SELECT list --- */
-typedef enum { SEL_STAR, SEL_COLUMN, SEL_AGG } SelKind;
+typedef enum { SEL_STAR, SEL_EXPR } SelKind;
 typedef struct {
-    SelKind   kind;
-    ColRef    col;           /* SEL_COLUMN, or the argument of SEL_AGG */
-    TokenType agg;           /* SEL_AGG: COUNT/SUM/AVG/MIN/MAX         */
-    int       agg_star;      /* SEL_AGG: 1 for COUNT(*)                */
-    char     *alias;         /* optional AS alias                     */
+    SelKind kind;
+    Expr   *expr;            /* SEL_EXPR: any scalar/aggregate expression */
+    char   *alias;           /* optional AS alias                        */
 } SelItem;
 
 typedef enum { JOIN_INNER, JOIN_LEFT } JoinType;
 typedef struct { JoinType type; char *table; char *alias; Expr *on; } JoinClause;
-typedef struct { ColRef col; int desc; } OrderItem;
+/* an ORDER BY key: an expression, or a positional index (`ORDER BY 2`) */
+typedef struct { Expr *expr; long pos; int desc; } OrderItem;
 
 typedef struct {
     SelItem    *items;    size_t nitems;
+    int         distinct;                 /* SELECT DISTINCT */
     char       *from_table; char *from_alias;
     JoinClause *joins;    size_t njoins;
     Expr       *where;                    /* NULL if absent */
@@ -712,6 +734,8 @@ static ColRef parse_colref(Parser *p) {
 static Expr *parse_expr(Parser *p);
 
 /* primary = literal | column | '(' expr ')' */
+/* primary = literal | NULL | agg'('[DISTINCT] expr | '*'')' | func'('args')'
+ *         | column | '(' expr ')' */
 static Expr *parse_primary(Parser *p) {
     Expr *e = calloc(1, sizeof(Expr));
     if (match(p, TOK_LPAREN)) {
@@ -738,7 +762,18 @@ static Expr *parse_primary(Parser *p) {
         e->kind = EXPR_AGG; e->agg = t; advance(p);
         expect(p, TOK_LPAREN, "expected '(' after aggregate");
         if (match(p, TOK_STAR)) e->agg_star = 1;
-        else e->col = parse_colref(p);
+        else { if (match(p, TOK_DISTINCT)) e->distinct = 1; e->left = parse_expr(p); }
+        expect(p, TOK_RPAREN, "expected ')'");
+        return e;
+    }
+    /* scalar function call: IDENT '(' args ')' */
+    if (check(p, TOK_IDENT) && p->tl->items[p->pos + 1].type == TOK_LPAREN) {
+        e->kind = EXPR_FUNC; e->fname = strdup(advance(p)->text);
+        advance(p);  /* '(' */
+        if (!check(p, TOK_RPAREN)) do {
+            e->args = realloc(e->args, (e->nargs + 1) * sizeof(Expr *));
+            e->args[e->nargs++] = parse_expr(p);
+        } while (match(p, TOK_COMMA));
         expect(p, TOK_RPAREN, "expected ')'");
         return e;
     }
@@ -746,56 +781,90 @@ static Expr *parse_primary(Parser *p) {
     perr(p, "expected a value or column"); free(e); return NULL;
 }
 
-/* comparison = primary [ (= != < > <= >=) primary ] */
+static Expr *mk(ExprKind k) { Expr *e = calloc(1, sizeof(Expr)); e->kind = k; return e; }
+static Expr *make_not(Expr *inner) { Expr *e = mk(EXPR_UNARY); e->op = TOK_NOT; e->left = inner; return e; }
+
+/* unary = '-' unary | primary */
+static Expr *parse_unary(Parser *p) {
+    if (match(p, TOK_MINUS)) { Expr *e = mk(EXPR_UNARY); e->op = TOK_MINUS; e->left = parse_unary(p); return e; }
+    return parse_primary(p);
+}
+/* mul = unary (('*' | '/') unary)* */
+static Expr *parse_mul(Parser *p) {
+    Expr *l = parse_unary(p);
+    while (check(p, TOK_STAR) || check(p, TOK_SLASH)) {
+        Expr *e = mk(EXPR_BINARY); e->op = advance(p)->type; e->left = l; e->right = parse_unary(p); l = e;
+    }
+    return l;
+}
+/* add = mul (('+' | '-') mul)* */
+static Expr *parse_add(Parser *p) {
+    Expr *l = parse_mul(p);
+    while (check(p, TOK_PLUS) || check(p, TOK_MINUS)) {
+        Expr *e = mk(EXPR_BINARY); e->op = advance(p)->type; e->left = l; e->right = parse_mul(p); l = e;
+    }
+    return l;
+}
+/* comparison = add [ compop add | IS [NOT] NULL | [NOT] IN(...) | [NOT] BETWEEN | [NOT] LIKE ] */
 static Expr *parse_comparison(Parser *p) {
-    Expr *left = parse_primary(p);
+    Expr *left = parse_add(p);
+    if (match(p, TOK_IS)) {
+        int neg = match(p, TOK_NOT);
+        expect(p, TOK_NULL_KW, "expected NULL after IS");
+        Expr *e = mk(EXPR_ISNULL); e->left = left; e->negated = neg; return e;
+    }
+    int neg = 0;
+    if (check(p, TOK_NOT)) { advance(p); neg = 1; }   /* NOT IN / NOT BETWEEN / NOT LIKE */
     TokenType t = peek(p)->type;
-    if (t == TOK_EQ || t == TOK_NE || t == TOK_LT || t == TOK_GT ||
-        t == TOK_LE || t == TOK_GE) {
+    if (t == TOK_IN) {
+        advance(p); expect(p, TOK_LPAREN, "expected '(' after IN");
+        Expr *e = mk(EXPR_IN); e->left = left;
+        if (!check(p, TOK_RPAREN)) do {
+            e->args = realloc(e->args, (e->nargs + 1) * sizeof(Expr *)); e->args[e->nargs++] = parse_expr(p);
+        } while (match(p, TOK_COMMA));
+        expect(p, TOK_RPAREN, "expected ')'");
+        return neg ? make_not(e) : e;
+    }
+    if (t == TOK_BETWEEN) {
         advance(p);
-        Expr *e = calloc(1, sizeof(Expr));
-        e->kind = EXPR_BINARY; e->op = t; e->left = left; e->right = parse_primary(p);
-        return e;
+        Expr *e = mk(EXPR_BETWEEN); e->left = left;
+        e->lo = parse_add(p); expect(p, TOK_AND, "expected AND in BETWEEN"); e->hi = parse_add(p);
+        return neg ? make_not(e) : e;
+    }
+    if (t == TOK_LIKE) {
+        advance(p);
+        Expr *e = mk(EXPR_BINARY); e->op = TOK_LIKE; e->left = left; e->right = parse_add(p);
+        return neg ? make_not(e) : e;
+    }
+    if (neg) { perr(p, "expected IN, BETWEEN or LIKE after NOT"); return left; }
+    if (t == TOK_EQ || t == TOK_NE || t == TOK_LT || t == TOK_GT || t == TOK_LE || t == TOK_GE) {
+        Expr *e = mk(EXPR_BINARY); e->op = advance(p)->type; e->left = left; e->right = parse_add(p); return e;
     }
     return left;
 }
-
-/* and = comparison (AND comparison)* */
+/* not = NOT not | comparison */
+static Expr *parse_not(Parser *p) {
+    if (match(p, TOK_NOT)) return make_not(parse_not(p));
+    return parse_comparison(p);
+}
+/* and = not (AND not)* */
 static Expr *parse_and(Parser *p) {
-    Expr *left = parse_comparison(p);
-    while (match(p, TOK_AND)) {
-        Expr *e = calloc(1, sizeof(Expr));
-        e->kind = EXPR_BINARY; e->op = TOK_AND; e->left = left; e->right = parse_comparison(p);
-        left = e;
-    }
+    Expr *left = parse_not(p);
+    while (match(p, TOK_AND)) { Expr *e = mk(EXPR_BINARY); e->op = TOK_AND; e->left = left; e->right = parse_not(p); left = e; }
     return left;
 }
-
 /* expr = and (OR and)* */
 static Expr *parse_expr(Parser *p) {
     Expr *left = parse_and(p);
-    while (match(p, TOK_OR)) {
-        Expr *e = calloc(1, sizeof(Expr));
-        e->kind = EXPR_BINARY; e->op = TOK_OR; e->left = left; e->right = parse_and(p);
-        left = e;
-    }
+    while (match(p, TOK_OR)) { Expr *e = mk(EXPR_BINARY); e->op = TOK_OR; e->left = left; e->right = parse_and(p); left = e; }
     return left;
 }
 
-/* one SELECT item: * | agg '(' (*|col) ')' [AS a] | col [AS a] */
+/* one SELECT item: '*' | expr [AS alias] */
 static SelItem parse_sel_item(Parser *p) {
     SelItem it = {0};
-    TokenType t = peek(p)->type;
-    if (t == TOK_STAR) { advance(p); it.kind = SEL_STAR; return it; }
-    if (t == TOK_COUNT || t == TOK_SUM || t == TOK_AVG || t == TOK_MIN || t == TOK_MAX) {
-        it.kind = SEL_AGG; it.agg = t; advance(p);
-        expect(p, TOK_LPAREN, "expected '(' after aggregate");
-        if (match(p, TOK_STAR)) it.agg_star = 1;
-        else it.col = parse_colref(p);
-        expect(p, TOK_RPAREN, "expected ')'");
-    } else {
-        it.kind = SEL_COLUMN; it.col = parse_colref(p);
-    }
+    if (check(p, TOK_STAR)) { advance(p); it.kind = SEL_STAR; return it; }
+    it.kind = SEL_EXPR; it.expr = parse_expr(p);
     if (match(p, TOK_AS)) {
         if (check(p, TOK_IDENT)) it.alias = strdup(advance(p)->text);
         else perr(p, "expected alias after AS");
@@ -821,6 +890,7 @@ static SelectStmt *parse_select(Parser *p) {
     s->limit = -1;
 
     expect(p, TOK_SELECT, "expected SELECT");
+    if (match(p, TOK_DISTINCT)) s->distinct = 1;
 
     /* select list */
     do {
@@ -859,8 +929,9 @@ static SelectStmt *parse_select(Parser *p) {
     if (match(p, TOK_ORDER)) {
         expect(p, TOK_BY, "expected BY after ORDER");
         do {
-            OrderItem o = {0};
-            o.col = parse_colref(p);
+            OrderItem o = {0}; o.pos = -1;
+            if (check(p, TOK_INT)) o.pos = strtol(advance(p)->text, NULL, 10);  /* positional */
+            else { o.expr = mk(EXPR_COLUMN); o.expr->col = parse_colref(p); }
             if (match(p, TOK_DESC)) o.desc = 1; else match(p, TOK_ASC);
             s->order = realloc(s->order, (s->norder + 1) * sizeof(OrderItem));
             s->order[s->norder++] = o;
@@ -880,14 +951,17 @@ static SelectStmt *parse_select(Parser *p) {
 static void free_colref(ColRef *c) { free(c->table); free(c->column); }
 static void free_expr(Expr *e) {
     if (!e) return;
-    if (e->kind == EXPR_COLUMN || e->kind == EXPR_AGG) free_colref(&e->col);
+    if (e->kind == EXPR_COLUMN) free_colref(&e->col);
     if (e->kind == EXPR_LITERAL && e->literal.type == TYPE_STRING) free(e->literal.as.str_val);
-    free_expr(e->left); free_expr(e->right);
+    free(e->fname);
+    for (size_t i = 0; i < e->nargs; i++) free_expr(e->args[i]);
+    free(e->args);
+    free_expr(e->left); free_expr(e->right); free_expr(e->lo); free_expr(e->hi);
     free(e);
 }
 static void free_select(SelectStmt *s) {
     if (!s) return;
-    for (size_t i = 0; i < s->nitems; i++) { free_colref(&s->items[i].col); free(s->items[i].alias); }
+    for (size_t i = 0; i < s->nitems; i++) { free_expr(s->items[i].expr); free(s->items[i].alias); }
     free(s->items);
     free(s->from_table); free(s->from_alias);
     for (size_t i = 0; i < s->njoins; i++) { free(s->joins[i].table); free(s->joins[i].alias); free_expr(s->joins[i].on); }
@@ -896,7 +970,7 @@ static void free_select(SelectStmt *s) {
     for (size_t i = 0; i < s->ngroup; i++) free_colref(&s->group[i]);
     free(s->group);
     free_expr(s->having);
-    for (size_t i = 0; i < s->norder; i++) free_colref(&s->order[i].col);
+    for (size_t i = 0; i < s->norder; i++) free_expr(s->order[i].expr);
     free(s->order);
     free(s);
 }
@@ -932,22 +1006,35 @@ static void print_expr(const Expr *e) {
             break;
         case EXPR_AGG:
             printf("%s(", tok_name(e->agg));
-            if (e->agg_star) printf("*"); else print_colref(&e->col);
+            if (e->agg_star) printf("*");
+            else { if (e->distinct) printf("DISTINCT "); print_expr(e->left); }
             printf(")");
             break;
+        case EXPR_UNARY:
+            printf("%s", e->op == TOK_MINUS ? "-" : "NOT ");
+            print_expr(e->left); break;
+        case EXPR_FUNC:
+            printf("%s(", e->fname);
+            for (size_t i = 0; i < e->nargs; i++) { if (i) printf(", "); print_expr(e->args[i]); }
+            printf(")"); break;
+        case EXPR_IN:
+            print_expr(e->left); printf(" IN (");
+            for (size_t i = 0; i < e->nargs; i++) { if (i) printf(", "); print_expr(e->args[i]); }
+            printf(")"); break;
+        case EXPR_ISNULL:
+            print_expr(e->left); printf(e->negated ? " IS NOT NULL" : " IS NULL"); break;
+        case EXPR_BETWEEN:
+            print_expr(e->left); printf(" BETWEEN "); print_expr(e->lo);
+            printf(" AND "); print_expr(e->hi); break;
     }
 }
 static void print_ast(const SelectStmt *s) {
-    printf("SELECT ");
+    printf("SELECT %s", s->distinct ? "DISTINCT " : "");
     for (size_t i = 0; i < s->nitems; i++) {
         if (i) printf(", ");
         SelItem *it = &s->items[i];
         if (it->kind == SEL_STAR) printf("*");
-        else if (it->kind == SEL_AGG) {
-            printf("%s(", tok_name(it->agg));
-            if (it->agg_star) printf("*"); else print_colref(&it->col);
-            printf(")");
-        } else print_colref(&it->col);
+        else print_expr(it->expr);
         if (it->alias) printf(" AS %s", it->alias);
     }
     printf("\n  FROM %s", s->from_table);
@@ -967,7 +1054,7 @@ static void print_ast(const SelectStmt *s) {
         printf("\n  ORDER BY ");
         for (size_t i = 0; i < s->norder; i++) {
             if (i) printf(", ");
-            print_colref(&s->order[i].col);
+            if (s->order[i].pos >= 0) printf("%ld", s->order[i].pos); else print_expr(s->order[i].expr);
             printf(s->order[i].desc ? " DESC" : " ASC");
         }
     }
@@ -1047,93 +1134,201 @@ static int rel_find_col(const Rel *r, const ColRef *c) {
 
 /* Row-level expression evaluation (WHERE, JOIN ON). Returned Values BORROW any
  * string pointers from the row/expr — never free them. */
-static Value eval_expr(const Expr *e, const Rel *r, const Row *row) {
-    Value v; v.type = TYPE_NULL;
-    switch (e->kind) {
-        case EXPR_LITERAL: return e->literal;
-        case EXPR_COLUMN: {
-            int idx = rel_find_col(r, &e->col);
-            return idx < 0 ? v : row->values[idx];
+/* forward decl: value_hash lives in the hash-join section below */
+static unsigned long value_hash(const Value *v);
+
+/* --- string arena: functions like UPPER() produce NEW strings; we stash them
+ * here and free them after each row/group is evaluated, so eval() can keep its
+ * "returned Values borrow their strings" contract. --- */
+static char **g_arena = NULL; static size_t g_arena_n = 0, g_arena_cap = 0;
+static char *arena_take(char *s) {
+    if (g_arena_n == g_arena_cap) { g_arena_cap = g_arena_cap ? g_arena_cap * 2 : 16;
+        g_arena = realloc(g_arena, g_arena_cap * sizeof(char *)); }
+    g_arena[g_arena_n++] = s; return s;
+}
+static void arena_reset(void) { for (size_t i = 0; i < g_arena_n; i++) free(g_arena[i]); g_arena_n = 0; }
+
+/* Evaluation context: a single row (row-level), or a group of rows (grouped,
+ * so aggregates and HAVING can be computed). */
+typedef struct { const Rel *rel; const Row *row; Row **grows; size_t gn; int grouped; } EvalCtx;
+static Value eval(const Expr *e, EvalCtx *cx);
+
+/* Case-insensitive SQL LIKE: % = any run, _ = any single char (ASCII). */
+static int like_match(const char *s, const char *p) {
+    while (*p) {
+        if (*p == '%') {
+            p++; if (!*p) return 1;
+            for (; *s; s++) if (like_match(s, p)) return 1;
+            return like_match(s, p);
+        } else if (*p == '_') {
+            if (!*s) return 0;
+            s++; p++;
+        } else {
+            if (!*s || tolower((unsigned char)*s) != tolower((unsigned char)*p)) return 0;
+            s++; p++;
         }
-        case EXPR_BINARY: {
-            if (e->op == TOK_AND || e->op == TOK_OR) {
-                int l = is_true(eval_expr(e->left, r, row));
-                int rr = is_true(eval_expr(e->right, r, row));
-                v.type = TYPE_INT; v.as.int_val = e->op == TOK_AND ? (l && rr) : (l || rr);
-                return v;
-            }
-            Value a = eval_expr(e->left, r, row), b = eval_expr(e->right, r, row);
-            int cmp; if (!value_compare(&a, &b, &cmp)) return v;   /* NULL */
-            int res = 0;
-            switch (e->op) {
-                case TOK_EQ: res = cmp == 0; break; case TOK_NE: res = cmp != 0; break;
-                case TOK_LT: res = cmp <  0; break; case TOK_GT: res = cmp >  0; break;
-                case TOK_LE: res = cmp <= 0; break; case TOK_GE: res = cmp >= 0; break;
-                default: break;
-            }
-            v.type = TYPE_INT; v.as.int_val = res; return v;
-        }
-        case EXPR_AGG: return v;                  /* not valid at row level */
     }
+    return *s == '\0';
+}
+
+/* Scalar functions: UPPER LOWER LENGTH ABS ROUND COALESCE TRIM. */
+static Value eval_func(const Expr *e, EvalCtx *cx) {
+    Value v; v.type = TYPE_NULL;
+    const char *fn = e->fname;
+    if (ci_equal(fn, "coalesce")) {
+        for (size_t i = 0; i < e->nargs; i++) { Value a = eval(e->args[i], cx); if (a.type != TYPE_NULL) return a; }
+        return v;
+    }
+    if (e->nargs < 1) return v;
+    Value a = eval(e->args[0], cx);
+    if (ci_equal(fn, "upper") || ci_equal(fn, "lower")) {
+        if (a.type != TYPE_STRING) return a;
+        char *o = strdup(a.as.str_val); int up = ci_equal(fn, "upper");
+        for (char *q = o; *q; q++) *q = up ? toupper((unsigned char)*q) : tolower((unsigned char)*q);
+        v.type = TYPE_STRING; v.as.str_val = arena_take(o); return v;
+    }
+    if (ci_equal(fn, "length")) {
+        if (a.type == TYPE_NULL) return v;
+        char b[64]; if (a.type != TYPE_STRING) value_str(&a, b, sizeof b);
+        v.type = TYPE_INT; v.as.int_val = (long)strlen(a.type == TYPE_STRING ? a.as.str_val : b); return v;
+    }
+    if (ci_equal(fn, "abs")) {
+        if (a.type == TYPE_INT)   { v.type = TYPE_INT;   v.as.int_val = a.as.int_val < 0 ? -a.as.int_val : a.as.int_val; }
+        if (a.type == TYPE_FLOAT) { v.type = TYPE_FLOAT; v.as.float_val = a.as.float_val < 0 ? -a.as.float_val : a.as.float_val; }
+        return v;
+    }
+    if (ci_equal(fn, "round")) {
+        if (a.type == TYPE_NULL) return v;
+        double d = a.type == TYPE_FLOAT ? a.as.float_val : (double)a.as.int_val;
+        int nd = 0; if (e->nargs > 1) { Value b = eval(e->args[1], cx); if (b.type == TYPE_INT) nd = (int)b.as.int_val; }
+        double f = 1; for (int i = 0; i < nd; i++) f *= 10;
+        double av = d < 0 ? -d : d; long ip = (long)(av * f + 0.5); double rr = (double)ip / f;
+        v.type = TYPE_FLOAT; v.as.float_val = d < 0 ? -rr : rr; return v;
+    }
+    if (ci_equal(fn, "trim")) {
+        if (a.type != TYPE_STRING) return a;
+        const char *s = a.as.str_val; while (*s == ' ') s++;
+        size_t len = strlen(s); while (len && s[len - 1] == ' ') len--;
+        char *o = malloc(len + 1); memcpy(o, s, len); o[len] = '\0';
+        v.type = TYPE_STRING; v.as.str_val = arena_take(o); return v;
+    }
+    fprintf(stderr, "unknown function: %s\n", fn);
     return v;
 }
 
-/* Compute an aggregate over a group's rows. */
-static Value eval_agg(TokenType agg, int star, const ColRef *arg,
-                      const Rel *r, Row **rows, size_t nrows) {
+/* Aggregate of an expression over the group (with optional DISTINCT). */
+static Value eval_agg_expr(const Expr *e, EvalCtx *cx) {
     Value out; out.type = TYPE_NULL;
-    if (agg == TOK_COUNT) {
-        long cnt = 0;
-        if (star) cnt = (long)nrows;
-        else { int idx = rel_find_col(r, arg);
-               if (idx >= 0) for (size_t i = 0; i < nrows; i++)
-                   if (rows[i]->values[idx].type != TYPE_NULL) cnt++; }
-        out.type = TYPE_INT; out.as.int_val = cnt; return out;
-    }
-    int idx = star ? -1 : rel_find_col(r, arg);
-    ColumnType at = idx >= 0 ? r->cols[idx].type : TYPE_INT;
-    double acc = 0, mn = 0, mx = 0; long cnt = 0; int have = 0;
-    if (idx >= 0) for (size_t i = 0; i < nrows; i++) {
-        Value *val = &rows[i]->values[idx];
-        if (val->type == TYPE_NULL) continue;
-        double d = val->type == TYPE_FLOAT ? val->as.float_val : (double)val->as.int_val;
-        if (!have) { mn = mx = d; have = 1; } else { if (d < mn) mn = d; if (d > mx) mx = d; }
-        acc += d; cnt++;
-    }
-    switch (agg) {
-        case TOK_SUM: if (at == TYPE_FLOAT) { out.type = TYPE_FLOAT; out.as.float_val = acc; }
-                      else { out.type = TYPE_INT; out.as.int_val = (long)acc; } break;
-        case TOK_AVG: out.type = TYPE_FLOAT; out.as.float_val = cnt ? acc / cnt : 0; break;
-        case TOK_MIN: case TOK_MAX: {
-            if (!have) break;                     /* stays NULL */
-            double m = agg == TOK_MIN ? mn : mx;
-            if (at == TYPE_FLOAT) { out.type = TYPE_FLOAT; out.as.float_val = m; }
-            else { out.type = TYPE_INT; out.as.int_val = (long)m; } break;
+    Row **rows = cx->grows; size_t n = cx->gn;
+    if (e->agg == TOK_COUNT && e->agg_star) { out.type = TYPE_INT; out.as.int_val = (long)n; return out; }
+
+    struct DNode { unsigned long h; Value v; struct DNode *next; } **buckets = NULL; size_t nb = 0;
+    if (e->distinct) { nb = 16; while (nb < n + 1) nb <<= 1; buckets = calloc(nb, sizeof(void *)); }
+
+    double acc = 0, mn = 0, mx = 0; long cnt = 0; int have = 0, isflt = 0;
+    EvalCtx sub = *cx; sub.grouped = 0; sub.grows = NULL; sub.gn = 0;
+    for (size_t i = 0; i < n; i++) {
+        sub.row = rows[i];
+        Value val = eval(e->left, &sub);
+        if (val.type == TYPE_NULL) continue;
+        if (e->distinct) {
+            unsigned long h = value_hash(&val); size_t b = h & (nb - 1); int seen = 0;
+            for (struct DNode *d = buckets[b]; d; d = d->next) { int c; if (d->h == h && value_compare(&d->v, &val, &c) && c == 0) { seen = 1; break; } }
+            if (seen) continue;
+            struct DNode *d = malloc(sizeof *d); d->h = h; d->v = val; d->next = buckets[b]; buckets[b] = d;
         }
+        cnt++;
+        if (val.type == TYPE_FLOAT) isflt = 1;
+        double d = val.type == TYPE_FLOAT ? val.as.float_val : (double)val.as.int_val;
+        if (!have) { mn = mx = d; have = 1; } else { if (d < mn) mn = d; if (d > mx) mx = d; }
+        acc += d;
+    }
+    if (e->distinct) { for (size_t b = 0; b < nb; b++) { struct DNode *d = buckets[b]; while (d) { struct DNode *x = d->next; free(d); d = x; } } free(buckets); }
+
+    switch (e->agg) {
+        case TOK_COUNT: out.type = TYPE_INT; out.as.int_val = cnt; break;
+        case TOK_SUM: if (isflt) { out.type = TYPE_FLOAT; out.as.float_val = acc; } else { out.type = TYPE_INT; out.as.int_val = (long)acc; } break;
+        case TOK_AVG: out.type = TYPE_FLOAT; out.as.float_val = cnt ? acc / cnt : 0; break;
+        case TOK_MIN: case TOK_MAX: if (have) { double m = e->agg == TOK_MIN ? mn : mx;
+            if (isflt) { out.type = TYPE_FLOAT; out.as.float_val = m; } else { out.type = TYPE_INT; out.as.int_val = (long)m; } } break;
         default: break;
     }
     return out;
 }
 
-/* Group-aware evaluation (HAVING): aggregates over the group, columns from
- * the group's first row. */
-static Value eval_group(const Expr *e, const Rel *r, Row **rows, size_t nrows) {
+/* The core evaluator. Returned Values borrow strings (arena or row); callers
+ * dup before the next arena_reset(). */
+static Value eval(const Expr *e, EvalCtx *cx) {
     Value v; v.type = TYPE_NULL;
+    if (!e) return v;
     switch (e->kind) {
         case EXPR_LITERAL: return e->literal;
-        case EXPR_AGG: return eval_agg(e->agg, e->agg_star, &e->col, r, rows, nrows);
         case EXPR_COLUMN: {
-            int idx = rel_find_col(r, &e->col);
-            return (idx < 0 || nrows == 0) ? v : rows[0]->values[idx];
+            int idx = rel_find_col(cx->rel, &e->col);
+            if (idx < 0) return v;
+            const Row *row = cx->grouped ? (cx->gn ? cx->grows[0] : NULL) : cx->row;
+            return row ? row->values[idx] : v;
+        }
+        case EXPR_AGG: return cx->grouped ? eval_agg_expr(e, cx) : v;
+        case EXPR_FUNC: return eval_func(e, cx);
+        case EXPR_UNARY: {
+            Value a = eval(e->left, cx);
+            if (e->op == TOK_NOT) {
+                if (a.type == TYPE_NULL) return v;
+                v.type = TYPE_INT; v.as.int_val = !is_true(a); return v;
+            }
+            if (a.type == TYPE_INT)   { v.type = TYPE_INT;   v.as.int_val = -a.as.int_val; }
+            if (a.type == TYPE_FLOAT) { v.type = TYPE_FLOAT; v.as.float_val = -a.as.float_val; }
+            return v;
+        }
+        case EXPR_ISNULL: {
+            Value a = eval(e->left, cx);
+            int isnull = (a.type == TYPE_NULL);
+            v.type = TYPE_INT; v.as.int_val = e->negated ? !isnull : isnull; return v;
+        }
+        case EXPR_IN: {
+            Value a = eval(e->left, cx);
+            if (a.type == TYPE_NULL) return v;
+            for (size_t i = 0; i < e->nargs; i++) {
+                Value b = eval(e->args[i], cx); int c;
+                if (value_compare(&a, &b, &c) && c == 0) { v.type = TYPE_INT; v.as.int_val = 1; return v; }
+            }
+            v.type = TYPE_INT; v.as.int_val = 0; return v;
+        }
+        case EXPR_BETWEEN: {
+            Value a = eval(e->left, cx), lo = eval(e->lo, cx), hi = eval(e->hi, cx);
+            int c1, c2;
+            if (!value_compare(&a, &lo, &c1) || !value_compare(&a, &hi, &c2)) return v;
+            v.type = TYPE_INT; v.as.int_val = (c1 >= 0 && c2 <= 0); return v;
         }
         case EXPR_BINARY: {
             if (e->op == TOK_AND || e->op == TOK_OR) {
-                int l = is_true(eval_group(e->left, r, rows, nrows));
-                int rr = is_true(eval_group(e->right, r, rows, nrows));
-                v.type = TYPE_INT; v.as.int_val = e->op == TOK_AND ? (l && rr) : (l || rr);
-                return v;
+                int l = is_true(eval(e->left, cx)), rr = is_true(eval(e->right, cx));
+                v.type = TYPE_INT; v.as.int_val = e->op == TOK_AND ? (l && rr) : (l || rr); return v;
             }
-            Value a = eval_group(e->left, r, rows, nrows), b = eval_group(e->right, r, rows, nrows);
+            Value a = eval(e->left, cx), b = eval(e->right, cx);
+            if (e->op == TOK_LIKE) {
+                if (a.type != TYPE_STRING || b.type != TYPE_STRING) return v;
+                v.type = TYPE_INT; v.as.int_val = like_match(a.as.str_val, b.as.str_val); return v;
+            }
+            if (e->op == TOK_PLUS || e->op == TOK_MINUS || e->op == TOK_STAR || e->op == TOK_SLASH) {
+                if (a.type == TYPE_NULL || b.type == TYPE_NULL) return v;
+                if (a.type == TYPE_STRING || b.type == TYPE_STRING) return v;
+                int flt = (a.type == TYPE_FLOAT || b.type == TYPE_FLOAT);
+                if (flt) {
+                    double x = a.type == TYPE_FLOAT ? a.as.float_val : (double)a.as.int_val;
+                    double y = b.type == TYPE_FLOAT ? b.as.float_val : (double)b.as.int_val;
+                    double r = e->op == TOK_PLUS ? x + y : e->op == TOK_MINUS ? x - y :
+                               e->op == TOK_STAR ? x * y : (y != 0 ? x / y : 0);
+                    if (e->op == TOK_SLASH && y == 0) return v;
+                    v.type = TYPE_FLOAT; v.as.float_val = r; return v;
+                }
+                long x = a.as.int_val, y = b.as.int_val;
+                if (e->op == TOK_SLASH && y == 0) return v;
+                long r = e->op == TOK_PLUS ? x + y : e->op == TOK_MINUS ? x - y :
+                         e->op == TOK_STAR ? x * y : x / y;   /* integer division, like sqlite */
+                v.type = TYPE_INT; v.as.int_val = r; return v;
+            }
             int cmp; if (!value_compare(&a, &b, &cmp)) return v;
             int res = 0;
             switch (e->op) {
@@ -1146,6 +1341,14 @@ static Value eval_group(const Expr *e, const Rel *r, Row **rows, size_t nrows) {
         }
     }
     return v;
+}
+
+/* thin wrappers preserving the old call-site signatures */
+static Value eval_expr(const Expr *e, const Rel *r, const Row *row) {
+    EvalCtx cx = { r, row, NULL, 0, 0 }; return eval(e, &cx);
+}
+static Value eval_group(const Expr *e, const Rel *r, Row **rows, size_t nrows) {
+    EvalCtx cx = { r, nrows ? rows[0] : NULL, rows, nrows, 1 }; return eval(e, &cx);
 }
 
 /* --- FROM: copy a stored Table into a Rel, tagging columns with a qualifier. */
@@ -1509,13 +1712,59 @@ static Rel join_index(const Rel *L, const Table *rt, const char *rq,
 /* --- WHERE: keep rows for which the predicate is true. */
 static Rel filter_rel(const Rel *in, const Expr *where) {
     Rel out = {0}; copy_schema(&out, in);
-    for (size_t i = 0; i < in->nrows; i++)
-        if (is_true(eval_expr(where, in, &in->rows[i]))) {
+    for (size_t i = 0; i < in->nrows; i++) {
+        int keep = is_true(eval_expr(where, in, &in->rows[i]));
+        arena_reset();
+        if (keep) {
             Row row; row.count = in->ncols; row.values = malloc(row.count * sizeof(Value));
             for (size_t j = 0; j < row.count; j++) row.values[j] = value_dup(&in->rows[i].values[j]);
             rel_add_row(&out, row);
         }
+    }
     return out;
+}
+
+/* Output column name for a SELECT item (alias > column name > function/agg name). */
+static const char *sel_name(const SelItem *it) {
+    if (it->alias) return it->alias;
+    const Expr *e = it->expr;
+    if (e->kind == EXPR_COLUMN) return e->col.column;
+    if (e->kind == EXPR_AGG)    return tok_name(e->agg);
+    if (e->kind == EXPR_FUNC)   return e->fname;
+    return "expr";
+}
+/* Best-effort output type for an expression (only affects the type label/width;
+ * printed values use each Value's own type). */
+static ColumnType expr_type(const Expr *e, const Rel *in) {
+    switch (e->kind) {
+        case EXPR_COLUMN: { int idx = rel_find_col(in, &e->col); return idx >= 0 ? in->cols[idx].type : TYPE_NULL; }
+        case EXPR_LITERAL: return e->literal.type;
+        case EXPR_AGG: return e->agg == TOK_COUNT ? TYPE_INT : e->agg == TOK_AVG ? TYPE_FLOAT
+                            : (e->left ? expr_type(e->left, in) : TYPE_INT);
+        case EXPR_FUNC:
+            if (ci_equal(e->fname, "length")) return TYPE_INT;
+            if (ci_equal(e->fname, "round"))  return TYPE_FLOAT;
+            if (ci_equal(e->fname, "upper") || ci_equal(e->fname, "lower") || ci_equal(e->fname, "trim")) return TYPE_STRING;
+            if (ci_equal(e->fname, "abs") && e->nargs) return expr_type(e->args[0], in);
+            return TYPE_NULL;
+        case EXPR_BINARY:
+            if (e->op == TOK_PLUS || e->op == TOK_MINUS || e->op == TOK_STAR || e->op == TOK_SLASH) {
+                ColumnType l = expr_type(e->left, in), r = expr_type(e->right, in);
+                return (l == TYPE_FLOAT || r == TYPE_FLOAT) ? TYPE_FLOAT : TYPE_INT;
+            }
+            return TYPE_INT;
+        case EXPR_UNARY: return e->op == TOK_MINUS ? expr_type(e->left, in) : TYPE_INT;
+        default: return TYPE_INT;   /* IN / ISNULL / BETWEEN -> boolean */
+    }
+}
+
+/* Does an expression tree contain an aggregate anywhere? */
+static int expr_has_agg(const Expr *e) {
+    if (!e) return 0;
+    if (e->kind == EXPR_AGG) return 1;
+    if (expr_has_agg(e->left) || expr_has_agg(e->right) || expr_has_agg(e->lo) || expr_has_agg(e->hi)) return 1;
+    for (size_t i = 0; i < e->nargs; i++) if (expr_has_agg(e->args[i])) return 1;
+    return 0;
 }
 
 /* Build the output column schema for the SELECT list against input rel `in`. */
@@ -1529,23 +1778,13 @@ static void out_schema(const SelectStmt *s, const Rel *in, ColMeta **cols, size_
                 c[n].qualifier = in->cols[k].qualifier ? strdup(in->cols[k].qualifier) : NULL;
                 c[n].name = strdup(in->cols[k].name); c[n].type = in->cols[k].type; n++;
             }
-        } else if (it->kind == SEL_COLUMN) {
-            int idx = rel_find_col(in, &it->col);
+        } else {
             c = realloc(c, (n + 1) * sizeof(ColMeta));
-            /* keep the qualifier so ORDER BY / HAVING can still find it by t.col */
-            c[n].qualifier = it->col.table ? strdup(it->col.table)
-                           : (idx >= 0 && in->cols[idx].qualifier ? strdup(in->cols[idx].qualifier) : NULL);
-            c[n].name = strdup(it->alias ? it->alias : it->col.column);
-            c[n].type = idx >= 0 ? in->cols[idx].type : TYPE_NULL; n++;
-        } else {   /* SEL_AGG */
-            int idx = it->agg_star ? -1 : rel_find_col(in, &it->col);
-            ColumnType at = idx >= 0 ? in->cols[idx].type : TYPE_INT;
-            ColumnType rt = it->agg == TOK_COUNT ? TYPE_INT :
-                            it->agg == TOK_AVG   ? TYPE_FLOAT : at;
-            c = realloc(c, (n + 1) * sizeof(ColMeta));
-            c[n].qualifier = NULL;
-            c[n].name = strdup(it->alias ? it->alias : tok_name(it->agg));
-            c[n].type = rt; n++;
+            const Expr *e = it->expr;
+            /* keep the qualifier of a plain column so ORDER BY t.col resolves */
+            c[n].qualifier = (e->kind == EXPR_COLUMN && e->col.table) ? strdup(e->col.table) : NULL;
+            c[n].name = strdup(sel_name(it));
+            c[n].type = expr_type(e, in); n++;
         }
     }
     *cols = c; *ncols = n;
@@ -1558,16 +1797,14 @@ static Rel project_plain(const SelectStmt *s, const Rel *in) {
     for (size_t i = 0; i < in->nrows; i++) {
         Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
         size_t vi = 0;
+        EvalCtx cx = { in, &in->rows[i], NULL, 0, 0 };
         for (size_t k = 0; k < s->nitems; k++) {
             SelItem *it = &s->items[k];
             if (it->kind == SEL_STAR)
                 for (size_t j = 0; j < in->ncols; j++) row.values[vi++] = value_dup(&in->rows[i].values[j]);
-            else {   /* SEL_COLUMN (aggregation path handles SEL_AGG) */
-                int idx = rel_find_col(in, &it->col);
-                Value nv; nv.type = TYPE_NULL;
-                row.values[vi++] = idx >= 0 ? value_dup(&in->rows[i].values[idx]) : nv;
-            }
+            else { Value a = eval(it->expr, &cx); row.values[vi++] = value_dup(&a); }
         }
+        arena_reset();
         rel_add_row(&out, row);
     }
     return out;
@@ -1642,9 +1879,10 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
     out_schema(s, in, &out.cols, &out.ncols);
     for (size_t gi = 0; gi < ng; gi++) {
         Row **grows = groups[gi].rows; size_t gn = groups[gi].nrows;
-        if (s->having && !is_true(eval_group(s->having, in, grows, gn))) continue;
+        if (s->having) { int keep = is_true(eval_group(s->having, in, grows, gn)); arena_reset(); if (!keep) continue; }
         Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
         size_t vi = 0;
+        EvalCtx cx = { in, gn ? grows[0] : NULL, grows, gn, 1 };
         for (size_t k = 0; k < s->nitems; k++) {
             SelItem *it = &s->items[k];
             if (it->kind == SEL_STAR) {
@@ -1652,15 +1890,9 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
                     Value nv; nv.type = TYPE_NULL;
                     row.values[vi++] = gn ? value_dup(&grows[0]->values[j]) : nv;
                 }
-            } else if (it->kind == SEL_COLUMN) {
-                int idx = rel_find_col(in, &it->col);
-                Value nv; nv.type = TYPE_NULL;
-                row.values[vi++] = (idx >= 0 && gn) ? value_dup(&grows[0]->values[idx]) : nv;
-            } else {
-                Value a = eval_agg(it->agg, it->agg_star, &it->col, in, grows, gn);
-                row.values[vi++] = value_dup(&a);
-            }
+            } else { Value a = eval(it->expr, &cx); row.values[vi++] = value_dup(&a); }
         }
+        arena_reset();
         rel_add_row(&out, row);
     }
     for (size_t gi = 0; gi < ng; gi++) free(groups[gi].rows);
@@ -1671,10 +1903,17 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
 /* --- ORDER BY via qsort. qsort has no context arg, so we pass it through
  * file-scope pointers (single-threaded, so this is safe here). */
 static const Rel *g_ord_rel; static const OrderItem *g_ord; static size_t g_ord_n;
+/* Resolve an ORDER BY key to a column index in the (output) relation: a
+ * positional `ORDER BY 2` uses column 2, otherwise resolve the column by name. */
+static int order_col_idx(const OrderItem *o) {
+    if (o->pos >= 1) return (o->pos - 1 < (long)g_ord_rel->ncols) ? (int)(o->pos - 1) : -1;
+    if (o->expr && o->expr->kind == EXPR_COLUMN) return rel_find_col(g_ord_rel, &o->expr->col);
+    return -1;
+}
 static int row_cmp(const void *pa, const void *pb) {
     const Row *ra = pa, *rb = pb;
     for (size_t k = 0; k < g_ord_n; k++) {
-        int idx = rel_find_col(g_ord_rel, &g_ord[k].col);
+        int idx = order_col_idx(&g_ord[k]);
         if (idx < 0) continue;
         Value *a = &ra->values[idx], *b = &rb->values[idx];
         int c;
@@ -1689,6 +1928,46 @@ static int row_cmp(const void *pa, const void *pb) {
 static void order_rel(Rel *r, const SelectStmt *s) {
     g_ord_rel = r; g_ord = s->order; g_ord_n = s->norder;
     qsort(r->rows, r->nrows, sizeof(Row), row_cmp);
+}
+
+/* SELECT DISTINCT: drop duplicate output rows, keeping first occurrence.
+ * Rows are keyed by a hash of all their values (O(rows) average). */
+static int rows_equal(const Row *a, const Row *b, size_t ncols) {
+    for (size_t j = 0; j < ncols; j++) {
+        const Value *x = &a->values[j], *y = &b->values[j];
+        if (x->type == TYPE_NULL && y->type == TYPE_NULL) continue;
+        if (x->type == TYPE_NULL || y->type == TYPE_NULL) return 0;
+        int c; if (!value_compare(x, y, &c) || c != 0) return 0;
+    }
+    return 1;
+}
+static void distinct_rel(Rel *r) {
+    struct RNode { unsigned long h; size_t idx; struct RNode *next; } **buckets;
+    size_t nb = 16; while (nb < r->nrows + 1) nb <<= 1;
+    buckets = calloc(nb, sizeof(void *));
+    Row *keep = NULL; size_t nk = 0, kc = 0;
+    for (size_t i = 0; i < r->nrows; i++) {
+        unsigned long h = 1469598103934665603UL;
+        for (size_t j = 0; j < r->ncols; j++) {
+            Value *v = &r->rows[i].values[j];
+            h ^= (v->type == TYPE_NULL) ? 0 : value_hash(v); h *= 1099511628211UL;
+        }
+        size_t b = h & (nb - 1); int dup = 0;
+        for (struct RNode *nd = buckets[b]; nd; nd = nd->next)
+            if (nd->h == h && rows_equal(&r->rows[i], &keep[nd->idx], r->ncols)) { dup = 1; break; }
+        if (dup) {
+            for (size_t j = 0; j < r->rows[i].count; j++)
+                if (r->rows[i].values[j].type == TYPE_STRING) free(r->rows[i].values[j].as.str_val);
+            free(r->rows[i].values);
+        } else {
+            if (nk == kc) { kc = kc ? kc * 2 : 16; keep = realloc(keep, kc * sizeof(Row)); }
+            struct RNode *nd = malloc(sizeof *nd); nd->h = h; nd->idx = nk; nd->next = buckets[b]; buckets[b] = nd;
+            keep[nk++] = r->rows[i];
+        }
+    }
+    for (size_t b = 0; b < nb; b++) { struct RNode *nd = buckets[b]; while (nd) { struct RNode *x = nd->next; free(nd); nd = x; } }
+    free(buckets); free(r->rows);
+    r->rows = keep; r->nrows = nk; r->cap = kc;
 }
 
 /* --- the conductor: run a SelectStmt against a set of loaded tables. --- */
@@ -1721,8 +2000,14 @@ static void esq_walk(const Expr *e, const char **q, int *ncols, int *bad) {
         if (!e->col.table) { *bad = 1; return; }
         if (!*q) *q = e->col.table;
         else if (strcmp(*q, e->col.table) != 0) *bad = 1;
-    } else if (e->kind == EXPR_AGG) { *bad = 1; }
-    else if (e->kind == EXPR_BINARY) { esq_walk(e->left, q, ncols, bad); esq_walk(e->right, q, ncols, bad); }
+        return;
+    }
+    if (e->kind == EXPR_AGG) { *bad = 1; return; }
+    /* recurse into EVERY child — a column hiding inside UPPER()/IN/BETWEEN/NOT
+       must be seen, or we'd wrongly push a multi-table predicate down one side */
+    esq_walk(e->left, q, ncols, bad); esq_walk(e->right, q, ncols, bad);
+    esq_walk(e->lo, q, ncols, bad);   esq_walk(e->hi, q, ncols, bad);
+    for (size_t i = 0; i < e->nargs; i++) esq_walk(e->args[i], q, ncols, bad);
 }
 /* If every column in e is qualified by ONE table, return that qualifier and set
  * *ncols; otherwise return NULL. Used to decide if a predicate can be pushed. */
@@ -1735,14 +2020,16 @@ static const char *expr_single_qualifier(const Expr *e, int *ncols) {
 /* Collect the distinct table qualifiers referenced by an expression. */
 static void expr_quals(const Expr *e, const char **set, int *n, int cap) {
     if (!e) return;
-    if (e->kind == EXPR_COLUMN || e->kind == EXPR_AGG) {
+    if (e->kind == EXPR_COLUMN) {
         if (e->col.table) {
             for (int i = 0; i < *n; i++) if (strcmp(set[i], e->col.table) == 0) return;
             if (*n < cap) set[(*n)++] = e->col.table;
         }
-    } else if (e->kind == EXPR_BINARY) {
-        expr_quals(e->left, set, n, cap); expr_quals(e->right, set, n, cap);
+        return;
     }
+    expr_quals(e->left, set, n, cap); expr_quals(e->right, set, n, cap);
+    expr_quals(e->lo, set, n, cap);   expr_quals(e->hi, set, n, cap);
+    for (size_t i = 0; i < e->nargs; i++) expr_quals(e->args[i], set, n, cap);
 }
 
 /* Cost-based join ordering. Fills order[0..njoins-1] with the sequence in which
@@ -1911,11 +2198,12 @@ static int execute_select(Database *db, const SelectStmt *s, Rel *result) {
     free(pushed); free(conj);
 
     int has_agg = 0;
-    for (size_t i = 0; i < s->nitems; i++) if (s->items[i].kind == SEL_AGG) has_agg = 1;
+    for (size_t i = 0; i < s->nitems; i++) if (s->items[i].kind == SEL_EXPR && expr_has_agg(s->items[i].expr)) has_agg = 1;
 
     Rel out = (has_agg || s->ngroup > 0) ? aggregate(s, &cur) : project_plain(s, &cur);
     rel_free(&cur);
 
+    if (s->distinct) distinct_rel(&out);
     if (s->norder) order_rel(&out, s);
     if (s->limit >= 0 && (size_t)s->limit < out.nrows) {
         for (size_t i = s->limit; i < out.nrows; i++) {
@@ -2021,7 +2309,7 @@ static void explain_select(Database *db, const SelectStmt *s) {
         est = equi ? (est > rsize ? est : rsize) : est * rsize * 0.1;
     }
     for (size_t c = 0; c < nconj; c++) if (!pushed[c]) { printf("  Filter (residual WHERE)\n"); break; }
-    int has_agg = 0; for (size_t i = 0; i < s->nitems; i++) if (s->items[i].kind == SEL_AGG) has_agg = 1;
+    int has_agg = 0; for (size_t i = 0; i < s->nitems; i++) if (s->items[i].kind == SEL_EXPR && expr_has_agg(s->items[i].expr)) has_agg = 1;
     if (has_agg || s->ngroup) printf("  Aggregate (%zu group key%s)\n", s->ngroup, s->ngroup == 1 ? "" : "s");
     if (s->norder) printf("  Sort (%zu key%s)\n", s->norder, s->norder == 1 ? "" : "s");
     if (s->limit >= 0) printf("  Limit %ld\n", s->limit);
