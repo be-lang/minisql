@@ -1,0 +1,5 @@
+id,name,height,active
+1,Alice,1.72,true
+2,Bob,1.80,false
+3,Carol,1.65,true
+4,Dave,1.91,false

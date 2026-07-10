@@ -1,0 +1,7 @@
+minisql
+minisql_asan
+t
+bench/*.csv
+bench/*.db
+bench/sq*/
+bench/b3.db

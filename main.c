@@ -1,0 +1,2186 @@
+/* ===========================================================================
+ * minisql — a tiny SQL engine in C, no dependencies.
+ *
+ * Loads CSV files as in-memory tables and runs SELECT queries over them:
+ * WHERE, INNER/LEFT JOIN, GROUP BY + aggregates, HAVING, ORDER BY, LIMIT.
+ * Includes a small cost-based planner (hash vs nested-loop join selection,
+ * predicate pushdown, greedy join reordering) and an EXPLAIN command.
+ *
+ * The whole engine lives in this one file, in top-to-bottom dependency order:
+ *   StringList  ->  CSV loader  ->  data model (Value/Row/Table)  ->  type
+ *   inference  ->  tokenizer  ->  recursive-descent parser (AST)  ->
+ *   executor (over an intermediate Rel)  ->  query planner  ->  REPL.
+ *
+ * Build:  make          (or: cc -Wall -Wextra -std=c11 -O2 -o minisql main.c)
+ * Run:    ./minisql     (then .help)      Test: make test      Bench: bench/bench.sh
+ * ========================================================================= */
+#define _POSIX_C_SOURCE 200809L  /* makes getline() and strdup() available */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <time.h>
+
+/* ---------------------------------------------------------------------------
+ * StringList: a growable array of strings.
+ * Used for BOTH the lines of a file and the fields of a line.
+ * This is the fundamental building block of the whole project — Table will be
+ * a growable array of rows, Row a growable array of values, same idea.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    char **items;      /* the strings; items[i] is one string           */
+    size_t count;      /* how many are currently stored                 */
+    size_t capacity;   /* how many we have room for before we must grow */
+} StringList;
+
+static void sl_init(StringList *sl) {
+    sl->items = NULL;
+    sl->count = 0;
+    sl->capacity = 0;
+}
+
+/* Append s to the list. Takes ownership of s (will be freed by sl_free). */
+static void sl_push(StringList *sl, char *s) {
+    if (sl->count == sl->capacity) {
+        /* out of room: double the capacity (start at 8) */
+        sl->capacity = sl->capacity ? sl->capacity * 2 : 8;
+        sl->items = realloc(sl->items, sl->capacity * sizeof(char *));
+    }
+    sl->items[sl->count++] = s;
+}
+
+static void sl_free(StringList *sl) {
+    for (size_t i = 0; i < sl->count; i++)
+        free(sl->items[i]);
+    free(sl->items);
+    sl_init(sl);  /* reset to a clean empty state */
+}
+
+/* ---------------------------------------------------------------------------
+ * The data model: how a relation lives in memory.
+ *
+ *   ColumnType  — what kind of data a cell holds.
+ *   Value       — ONE cell (the atomic value of the relational model).
+ *   Row         — one tuple: an array of Values.
+ *   Table       — one relation: a schema (column names + types) plus rows.
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    TYPE_INT,
+    TYPE_FLOAT,
+    TYPE_STRING,
+    TYPE_NULL      /* an empty / missing cell */
+} ColumnType;
+
+/* A Value is a "tagged union": `type` says which member of `as` is the live one.
+ * The union stores only ONE of these at a time (they share memory), so the tag
+ * is the ONLY way to know how to read it. Reading the wrong member = garbage.
+ * Storing a long + a double + a char* separately would waste space; the union
+ * says "it's exactly one of these" and the tag says which. */
+typedef struct {
+    ColumnType type;
+    union {
+        long   int_val;
+        double float_val;
+        char  *str_val;   /* owned: freed when the Value is freed */
+    } as;
+} Value;
+
+/* A Row is one tuple: `count` values, in column order. */
+typedef struct {
+    Value *values;
+    size_t count;
+} Row;
+
+/* A Table is a relation. Column names and types are kept as two parallel
+ * arrays of length `col_count` (col_names[i] has type col_types[i]).
+ * `rows` is a growable array, same doubling trick as StringList. */
+struct Index;                          /* defined near the executor (needs value hashing) */
+static void indexes_free(struct Index *arr, size_t n);   /* frees an index array */
+
+typedef struct {
+    char       *name;         /* usually derived from the filename        */
+    char      **col_names;    /* length col_count                         */
+    ColumnType *col_types;    /* length col_count                         */
+    size_t      col_count;
+    Row        *rows;         /* length row_count, room for row_capacity  */
+    size_t      row_count;
+    size_t      row_capacity;
+    struct Index *indexes;    /* optional secondary indexes (see .index)  */
+    size_t      nindex;
+} Table;
+
+static void table_free(Table *t) {
+    free(t->name);
+    for (size_t i = 0; i < t->col_count; i++)
+        free(t->col_names[i]);
+    free(t->col_names);
+    free(t->col_types);
+    for (size_t i = 0; i < t->row_count; i++) {
+        for (size_t j = 0; j < t->rows[i].count; j++)
+            if (t->rows[i].values[j].type == TYPE_STRING)
+                free(t->rows[i].values[j].as.str_val);
+        free(t->rows[i].values);
+    }
+    free(t->rows);
+    indexes_free(t->indexes, t->nindex);
+}
+
+/* ---------------------------------------------------------------------------
+ * read_lines: read a whole file into a StringList of lines.
+ * Each line has its trailing newline stripped. On error, returns an empty list.
+ * ------------------------------------------------------------------------- */
+static StringList read_lines(const char *filename) {
+    StringList lines;
+    sl_init(&lines);
+
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        perror("Error opening file");
+        return lines;  /* empty list — caller can check .count == 0 */
+    }
+
+    /* getline grows `buf` as needed, so lines of ANY length work — no more
+       fixed 256-byte limit. It returns the length read, or -1 at EOF. */
+    char *buf = NULL;
+    size_t bufsize = 0;
+    ssize_t len;
+    while ((len = getline(&buf, &bufsize, file)) != -1) {
+        /* strip trailing newline / carriage-return so fields stay clean */
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+            buf[--len] = '\0';
+        /* strdup makes our OWN copy — getline reuses `buf` next loop */
+        sl_push(&lines, strdup(buf));
+    }
+
+    free(buf);
+    fclose(file);
+    return lines;
+}
+
+/* ---------------------------------------------------------------------------
+ * split_line: cut one line into fields, honoring RFC 4180 quoting.
+ *
+ *   plain fields  : read until a comma.               a,b,c      -> a | b | c
+ *   quoted fields : wrapped in "..." — a comma inside is literal.
+ *                     "Lennon, John"                  -> Lennon, John
+ *   escaped quote : a doubled "" inside a quoted field is one literal ".
+ *                     "she said ""hi"""               -> she said "hi"
+ *
+ * Known limitation: a quoted field containing a NEWLINE would span two physical
+ * lines, but read_lines already split on newlines, so we can't see it here.
+ * Supporting that needs record-based reading — deferred, not needed for our data.
+ * ------------------------------------------------------------------------- */
+static StringList split_line(const char *line) {
+    StringList fields;
+    sl_init(&fields);
+
+    /* A single field can never be longer than the whole line, so one buffer of
+       that size is always big enough; we reuse it for every field. */
+    char *buf = malloc(strlen(line) + 1);
+    size_t i = 0;   /* read cursor into `line` */
+
+    for (;;) {
+        size_t b = 0;   /* write cursor into `buf` for the current field */
+
+        if (line[i] == '"') {
+            i++;                                    /* consume opening quote */
+            while (line[i] != '\0') {
+                if (line[i] == '"' && line[i + 1] == '"') {
+                    buf[b++] = '"';                 /* "" -> one literal quote */
+                    i += 2;
+                } else if (line[i] == '"') {
+                    i++;                            /* closing quote */
+                    break;
+                } else {
+                    buf[b++] = line[i++];           /* literal char (incl. ',') */
+                }
+            }
+            while (line[i] != '\0' && line[i] != ',')
+                i++;                                /* skip anything until the comma */
+        } else {
+            while (line[i] != '\0' && line[i] != ',')
+                buf[b++] = line[i++];               /* plain field */
+        }
+
+        buf[b] = '\0';
+        sl_push(&fields, strdup(buf));
+
+        if (line[i] == ',') { i++; continue; }      /* another field follows */
+        break;                                       /* end of line */
+    }
+
+    free(buf);
+    return fields;
+}
+
+/* ---------------------------------------------------------------------------
+ * parse_header: build the SCHEMA of a Table from the header line.
+ * Column names come from splitting line 0. Types are left as TYPE_NULL
+ * placeholders — inference (the next step) will fill them in. No rows yet.
+ * ------------------------------------------------------------------------- */
+static Table parse_header(const char *name, const char *header) {
+    StringList cols = split_line(header);
+
+    Table t;
+    t.name         = strdup(name);
+    t.col_count    = cols.count;
+    t.col_names    = malloc(t.col_count * sizeof(char *));
+    t.col_types    = malloc(t.col_count * sizeof(ColumnType));
+    t.rows         = NULL;
+    t.row_count    = 0;
+    t.row_capacity = 0;
+    t.indexes      = NULL;
+    t.nindex       = 0;
+
+    for (size_t i = 0; i < t.col_count; i++) {
+        t.col_names[i] = strdup(cols.items[i]);
+        t.col_types[i] = TYPE_NULL;   /* unknown until we infer it */
+    }
+
+    sl_free(&cols);
+    return t;
+}
+
+/* ---------------------------------------------------------------------------
+ * Type inference: decide a column's type by looking at its raw string values.
+ *
+ * looks_like_int / looks_like_float use the strtol/strtod "endptr trick":
+ * the parse function sets `end` to the first character it could NOT consume.
+ * If `end` lands on the '\0', the WHOLE string was a valid number. If it stops
+ * early (e.g. at '.' or a letter), the string only *starts* like a number, so
+ * we reject it. errno catches overflow.
+ * ------------------------------------------------------------------------- */
+static int looks_like_int(const char *s) {
+    if (*s == '\0') return 0;              /* empty is not an int */
+    char *end;
+    errno = 0;
+    strtol(s, &end, 10);
+    return errno == 0 && *end == '\0';     /* consumed everything, no overflow */
+}
+
+static int looks_like_float(const char *s) {
+    if (*s == '\0') return 0;
+    char *end;
+    errno = 0;
+    strtod(s, &end);
+    return errno == 0 && *end == '\0';
+}
+
+/* Scan every value in a column and decide its type.
+ * Order matters: an all-int column is INT, but "1, 2.5, 3" widens to FLOAT.
+ * Empty cells don't vote (they become NULL later); an all-empty column is STRING. */
+static ColumnType infer_column_type(const StringList *col) {
+    int seen_value = 0, all_int = 1, all_float = 1;
+    for (size_t i = 0; i < col->count; i++) {
+        const char *s = col->items[i];
+        if (*s == '\0') continue;          /* empty cell: skip */
+        seen_value = 1;
+        if (!looks_like_int(s))   all_int = 0;
+        if (!looks_like_float(s)) all_float = 0;
+    }
+    if (!seen_value) return TYPE_STRING;   /* column was entirely empty */
+    if (all_int)   return TYPE_INT;        /* test int BEFORE float */
+    if (all_float) return TYPE_FLOAT;
+    return TYPE_STRING;
+}
+
+/* Convert one raw field into a typed Value, given its column's decided type.
+ * An empty field becomes NULL regardless of the column type. */
+static Value make_value_from_string(const char *raw, ColumnType type) {
+    Value v;
+    if (*raw == '\0') {                     /* missing cell */
+        v.type = TYPE_NULL;
+        return v;
+    }
+    switch (type) {
+        case TYPE_INT:
+            v.type = TYPE_INT;
+            v.as.int_val = strtol(raw, NULL, 10);
+            break;
+        case TYPE_FLOAT:
+            v.type = TYPE_FLOAT;
+            v.as.float_val = strtod(raw, NULL);
+            break;
+        default:                            /* STRING (or a NULL-typed column) */
+            v.type = TYPE_STRING;
+            v.as.str_val = strdup(raw);
+            break;
+    }
+    return v;
+}
+
+/* Small helper: human-readable name for a type, handy for printing schemas. */
+static const char *type_name(ColumnType t) {
+    switch (t) {
+        case TYPE_INT:    return "int";
+        case TYPE_FLOAT:  return "float";
+        case TYPE_STRING: return "string";
+        case TYPE_NULL:   return "null";
+    }
+    return "?";
+}
+
+/* Append a row to a table, growing the row array by doubling (same trick as
+ * sl_push). The table takes ownership of the row's Values. */
+static void table_add_row(Table *t, Row row) {
+    if (t->row_count == t->row_capacity) {
+        t->row_capacity = t->row_capacity ? t->row_capacity * 2 : 8;
+        t->rows = realloc(t->rows, t->row_capacity * sizeof(Row));
+    }
+    t->rows[t->row_count++] = row;
+}
+
+/* ---------------------------------------------------------------------------
+ * load_table: the conductor. Turns a CSV file into a fully typed Table by
+ * wiring together every function built so far.
+ * ------------------------------------------------------------------------- */
+static Table load_table(const char *name, const char *filename) {
+    StringList lines = read_lines(filename);
+
+    Table t;
+    if (lines.count == 0) {                 /* empty / missing file */
+        memset(&t, 0, sizeof t);
+        t.name = strdup(name);
+        sl_free(&lines);
+        return t;
+    }
+
+    t = parse_header(name, lines.items[0]);
+
+    /* Split every data row ONCE and keep the field lists — we use them twice:
+       first to infer column types, then to build the typed Values. */
+    size_t nrows = lines.count - 1;
+    StringList *rowfields = malloc(nrows * sizeof(StringList));
+    for (size_t r = 0; r < nrows; r++)
+        rowfields[r] = split_line(lines.items[r + 1]);
+
+    /* Infer each column's type from its values across all rows. We BORROW the
+       already-split field pointers (no strdup) — inference only reads them —
+       and free just the pointer array, not the strings. */
+    char **colvals = malloc(nrows * sizeof(char *));
+    for (size_t c = 0; c < t.col_count; c++) {
+        StringList col = { colvals, 0, nrows };
+        for (size_t r = 0; r < nrows; r++)
+            if (c < rowfields[r].count) colvals[col.count++] = rowfields[r].items[c];
+        t.col_types[c] = infer_column_type(&col);
+    }
+    free(colvals);
+
+    /* Build one typed Row per data line. A missing field (ragged row) is
+       treated as empty -> NULL, so every row has exactly col_count values. */
+    for (size_t r = 0; r < nrows; r++) {
+        Row row;
+        row.count  = t.col_count;
+        row.values = malloc(t.col_count * sizeof(Value));
+        for (size_t c = 0; c < t.col_count; c++) {
+            const char *raw = (c < rowfields[r].count) ? rowfields[r].items[c] : "";
+            row.values[c] = make_value_from_string(raw, t.col_types[c]);
+        }
+        table_add_row(&t, row);
+    }
+
+    for (size_t r = 0; r < nrows; r++) sl_free(&rowfields[r]);
+    free(rowfields);
+    sl_free(&lines);
+    return t;
+}
+
+/* ---------------------------------------------------------------------------
+ * print_table: render a Table as an aligned grid — your eyes for the whole
+ * rest of the project, since query results are Tables too.
+ * ------------------------------------------------------------------------- */
+static void value_str(const Value *v, char *buf, size_t n) {
+    switch (v->type) {
+        case TYPE_INT:    snprintf(buf, n, "%ld", v->as.int_val);   break;
+        case TYPE_FLOAT:  snprintf(buf, n, "%g",  v->as.float_val); break;
+        case TYPE_STRING: snprintf(buf, n, "%s",  v->as.str_val);   break;
+        case TYPE_NULL:   snprintf(buf, n, "NULL");                 break;
+    }
+}
+
+static void print_table(const Table *t) {
+    char buf[512];
+
+    /* First pass: each column is as wide as the widest of its name, its type
+       label, and any value in it. */
+    size_t *w = malloc(t->col_count * sizeof(size_t));
+    for (size_t c = 0; c < t->col_count; c++) {
+        w[c] = strlen(t->col_names[c]);
+        size_t tl = strlen(type_name(t->col_types[c]));
+        if (tl > w[c]) w[c] = tl;
+    }
+    for (size_t r = 0; r < t->row_count; r++)
+        for (size_t c = 0; c < t->col_count; c++) {
+            value_str(&t->rows[r].values[c], buf, sizeof buf);
+            size_t len = strlen(buf);
+            if (len > w[c]) w[c] = len;
+        }
+
+    /* Column names, then a types row, then a separator, then the data. */
+    for (size_t c = 0; c < t->col_count; c++)
+        printf("%-*s  ", (int)w[c], t->col_names[c]);
+    printf("\n");
+    for (size_t c = 0; c < t->col_count; c++)
+        printf("%-*s  ", (int)w[c], type_name(t->col_types[c]));
+    printf("\n");
+    for (size_t c = 0; c < t->col_count; c++) {
+        for (size_t i = 0; i < w[c]; i++) putchar('-');
+        printf("  ");
+    }
+    printf("\n");
+    for (size_t r = 0; r < t->row_count; r++) {
+        for (size_t c = 0; c < t->col_count; c++) {
+            value_str(&t->rows[r].values[c], buf, sizeof buf);
+            printf("%-*s  ", (int)w[c], buf);
+        }
+        printf("\n");
+    }
+
+    free(w);
+    printf("(%zu row%s)\n", t->row_count, t->row_count == 1 ? "" : "s");
+}
+
+/* ===========================================================================
+ * STEP 2 — TOKENIZER (lexer): SQL text -> a stream of tokens.
+ * Tokens are the atoms of the language. No meaning yet, just "what kind of
+ * chunk is this": a keyword, a name, a number, a string, or an operator.
+ * ========================================================================= */
+typedef enum {
+    /* keywords */
+    TOK_SELECT, TOK_FROM, TOK_WHERE, TOK_JOIN, TOK_ON, TOK_LEFT, TOK_INNER,
+    TOK_GROUP, TOK_BY, TOK_ORDER, TOK_ASC, TOK_DESC, TOK_HAVING, TOK_LIMIT,
+    TOK_AND, TOK_OR, TOK_NOT, TOK_AS, TOK_NULL_KW,
+    TOK_COUNT, TOK_SUM, TOK_AVG, TOK_MIN, TOK_MAX,
+    /* literals / names */
+    TOK_IDENT, TOK_STRING, TOK_INT, TOK_FLOAT,
+    /* punctuation & operators */
+    TOK_STAR, TOK_COMMA, TOK_DOT, TOK_LPAREN, TOK_RPAREN,
+    TOK_EQ, TOK_NE, TOK_LT, TOK_GT, TOK_LE, TOK_GE,
+    TOK_EOF, TOK_ERROR
+} TokenType;
+
+typedef struct {
+    TokenType type;
+    char     *text;   /* owned lexeme for ident/string/number; else NULL */
+    int       pos;    /* offset into the SQL string, for error messages  */
+} Token;
+
+typedef struct {
+    Token *items;
+    size_t count;
+    size_t capacity;
+} TokenList;
+
+/* keyword table: text (lowercase) -> token type */
+static const struct { const char *kw; TokenType type; } KEYWORDS[] = {
+    {"select", TOK_SELECT}, {"from", TOK_FROM}, {"where", TOK_WHERE},
+    {"join", TOK_JOIN}, {"on", TOK_ON}, {"left", TOK_LEFT}, {"inner", TOK_INNER},
+    {"group", TOK_GROUP}, {"by", TOK_BY}, {"order", TOK_ORDER},
+    {"asc", TOK_ASC}, {"desc", TOK_DESC}, {"having", TOK_HAVING},
+    {"limit", TOK_LIMIT}, {"and", TOK_AND}, {"or", TOK_OR}, {"not", TOK_NOT},
+    {"as", TOK_AS}, {"null", TOK_NULL_KW},
+    {"count", TOK_COUNT}, {"sum", TOK_SUM}, {"avg", TOK_AVG},
+    {"min", TOK_MIN}, {"max", TOK_MAX},
+};
+
+static int ci_equal(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == '\0' && *b == '\0';
+}
+
+static void tl_push(TokenList *tl, TokenType type, char *text, int pos) {
+    if (tl->count == tl->capacity) {
+        tl->capacity = tl->capacity ? tl->capacity * 2 : 16;
+        tl->items = realloc(tl->items, tl->capacity * sizeof(Token));
+    }
+    tl->items[tl->count].type = type;
+    tl->items[tl->count].text = text;
+    tl->items[tl->count].pos  = pos;
+    tl->count++;
+}
+
+static void tl_free(TokenList *tl) {
+    for (size_t i = 0; i < tl->count; i++)
+        free(tl->items[i].text);
+    free(tl->items);
+    tl->items = NULL; tl->count = 0; tl->capacity = 0;
+}
+
+/* Copy the substring sql[start..end) into a fresh NUL-terminated string. */
+static char *substr(const char *sql, int start, int end) {
+    int n = end - start;
+    char *s = malloc(n + 1);
+    memcpy(s, sql + start, n);
+    s[n] = '\0';
+    return s;
+}
+
+/* Turn a whole SQL string into a TokenList (always ends with TOK_EOF).
+ * On a bad character, pushes a TOK_ERROR token and stops. */
+static TokenList tokenize(const char *sql) {
+    TokenList tl = {0};
+    int i = 0;
+
+    while (sql[i] != '\0') {
+        char c = sql[i];
+
+        if (isspace((unsigned char)c)) { i++; continue; }
+
+        /* identifiers & keywords: [A-Za-z_][A-Za-z0-9_]* */
+        if (isalpha((unsigned char)c) || c == '_') {
+            int start = i;
+            while (isalnum((unsigned char)sql[i]) || sql[i] == '_') i++;
+            char *word = substr(sql, start, i);
+            TokenType type = TOK_IDENT;
+            for (size_t k = 0; k < sizeof(KEYWORDS)/sizeof(KEYWORDS[0]); k++)
+                if (ci_equal(word, KEYWORDS[k].kw)) { type = KEYWORDS[k].type; break; }
+            if (type == TOK_IDENT) tl_push(&tl, TOK_IDENT, word, start);
+            else { free(word); tl_push(&tl, type, NULL, start); }
+            continue;
+        }
+
+        /* numbers: digits, with an optional single '.' making it a float */
+        if (isdigit((unsigned char)c)) {
+            int start = i;
+            int is_float = 0;
+            while (isdigit((unsigned char)sql[i])) i++;
+            if (sql[i] == '.') { is_float = 1; i++; while (isdigit((unsigned char)sql[i])) i++; }
+            tl_push(&tl, is_float ? TOK_FLOAT : TOK_INT, substr(sql, start, i), start);
+            continue;
+        }
+
+        /* string literal: '...'  ('' is an escaped single quote) */
+        if (c == '\'') {
+            int start = i;
+            i++;                              /* skip opening quote */
+            /* build the unescaped contents into a buffer */
+            char *out = malloc(strlen(sql) + 1);
+            int b = 0;
+            while (sql[i] != '\0') {
+                if (sql[i] == '\'' && sql[i+1] == '\'') { out[b++] = '\''; i += 2; }
+                else if (sql[i] == '\'') { i++; break; }
+                else out[b++] = sql[i++];
+            }
+            out[b] = '\0';
+            tl_push(&tl, TOK_STRING, out, start);
+            continue;
+        }
+
+        /* operators & punctuation */
+        int start = i;
+        switch (c) {
+            case '*': tl_push(&tl, TOK_STAR,   NULL, start); i++; break;
+            case ',': tl_push(&tl, TOK_COMMA,  NULL, start); i++; break;
+            case '.': tl_push(&tl, TOK_DOT,    NULL, start); i++; break;
+            case '(': tl_push(&tl, TOK_LPAREN, NULL, start); i++; break;
+            case ')': tl_push(&tl, TOK_RPAREN, NULL, start); i++; break;
+            case '=': tl_push(&tl, TOK_EQ,     NULL, start); i++; break;
+            case '<':
+                if (sql[i+1] == '=') { tl_push(&tl, TOK_LE, NULL, start); i += 2; }
+                else if (sql[i+1] == '>') { tl_push(&tl, TOK_NE, NULL, start); i += 2; }
+                else { tl_push(&tl, TOK_LT, NULL, start); i++; }
+                break;
+            case '>':
+                if (sql[i+1] == '=') { tl_push(&tl, TOK_GE, NULL, start); i += 2; }
+                else { tl_push(&tl, TOK_GT, NULL, start); i++; }
+                break;
+            case '!':
+                if (sql[i+1] == '=') { tl_push(&tl, TOK_NE, NULL, start); i += 2; }
+                else { fprintf(stderr, "tokenize: stray '!' at %d\n", i);
+                       tl_push(&tl, TOK_ERROR, NULL, start); goto done; }
+                break;
+            default:
+                fprintf(stderr, "tokenize: unexpected character '%c' at %d\n", c, i);
+                tl_push(&tl, TOK_ERROR, NULL, start);
+                goto done;
+        }
+    }
+done:
+    tl_push(&tl, TOK_EOF, NULL, i);
+    return tl;
+}
+
+/* debug helper: readable name for a token type */
+static const char *tok_name(TokenType t) {
+    switch (t) {
+        case TOK_SELECT: return "SELECT"; case TOK_FROM: return "FROM";
+        case TOK_WHERE: return "WHERE"; case TOK_JOIN: return "JOIN";
+        case TOK_ON: return "ON"; case TOK_LEFT: return "LEFT";
+        case TOK_INNER: return "INNER"; case TOK_GROUP: return "GROUP";
+        case TOK_BY: return "BY"; case TOK_ORDER: return "ORDER";
+        case TOK_ASC: return "ASC"; case TOK_DESC: return "DESC";
+        case TOK_HAVING: return "HAVING"; case TOK_LIMIT: return "LIMIT";
+        case TOK_AND: return "AND"; case TOK_OR: return "OR";
+        case TOK_NOT: return "NOT"; case TOK_AS: return "AS";
+        case TOK_NULL_KW: return "NULL"; case TOK_COUNT: return "COUNT";
+        case TOK_SUM: return "SUM"; case TOK_AVG: return "AVG";
+        case TOK_MIN: return "MIN"; case TOK_MAX: return "MAX";
+        case TOK_IDENT: return "ident"; case TOK_STRING: return "string";
+        case TOK_INT: return "int"; case TOK_FLOAT: return "float";
+        case TOK_STAR: return "*"; case TOK_COMMA: return ","; case TOK_DOT: return ".";
+        case TOK_LPAREN: return "("; case TOK_RPAREN: return ")";
+        case TOK_EQ: return "="; case TOK_NE: return "!="; case TOK_LT: return "<";
+        case TOK_GT: return ">"; case TOK_LE: return "<="; case TOK_GE: return ">=";
+        case TOK_EOF: return "EOF"; case TOK_ERROR: return "ERROR";
+    }
+    return "?";
+}
+
+/* ===========================================================================
+ * STEP 3 — PARSER (recursive descent): tokens -> an AST (a SelectStmt).
+ * Each grammar rule becomes one function that consumes tokens and builds a
+ * node. This is the "logical plan" in its simplest form.
+ * ========================================================================= */
+
+/* A column reference, optionally qualified by a table/alias: [table.]column */
+typedef struct { char *table; char *column; } ColRef;
+
+/* --- expression tree (for WHERE / HAVING / JOIN ON) --- */
+typedef enum { EXPR_COLUMN, EXPR_LITERAL, EXPR_BINARY, EXPR_AGG } ExprKind;
+typedef struct Expr {
+    ExprKind kind;
+    ColRef   col;            /* EXPR_COLUMN, or the arg of EXPR_AGG   */
+    Value    literal;        /* EXPR_LITERAL                         */
+    TokenType op;            /* EXPR_BINARY: comparison or AND/OR    */
+    TokenType agg;           /* EXPR_AGG: COUNT/SUM/AVG/MIN/MAX       */
+    int       agg_star;      /* EXPR_AGG: 1 for COUNT(*)             */
+    struct Expr *left, *right;
+} Expr;
+
+/* --- one item in the SELECT list --- */
+typedef enum { SEL_STAR, SEL_COLUMN, SEL_AGG } SelKind;
+typedef struct {
+    SelKind   kind;
+    ColRef    col;           /* SEL_COLUMN, or the argument of SEL_AGG */
+    TokenType agg;           /* SEL_AGG: COUNT/SUM/AVG/MIN/MAX         */
+    int       agg_star;      /* SEL_AGG: 1 for COUNT(*)                */
+    char     *alias;         /* optional AS alias                     */
+} SelItem;
+
+typedef enum { JOIN_INNER, JOIN_LEFT } JoinType;
+typedef struct { JoinType type; char *table; char *alias; Expr *on; } JoinClause;
+typedef struct { ColRef col; int desc; } OrderItem;
+
+typedef struct {
+    SelItem    *items;    size_t nitems;
+    char       *from_table; char *from_alias;
+    JoinClause *joins;    size_t njoins;
+    Expr       *where;                    /* NULL if absent */
+    ColRef     *group;    size_t ngroup;
+    Expr       *having;                   /* NULL if absent */
+    OrderItem  *order;    size_t norder;
+    long        limit;                    /* -1 = no LIMIT  */
+} SelectStmt;
+
+/* --- parser state --- */
+typedef struct { TokenList *tl; size_t pos; int error; } Parser;
+
+static Token *peek(Parser *p)            { return &p->tl->items[p->pos]; }
+static int    check(Parser *p, TokenType t){ return peek(p)->type == t; }
+static Token *advance(Parser *p)         { Token *t = peek(p); if (t->type != TOK_EOF) p->pos++; return t; }
+static int    match(Parser *p, TokenType t){ if (check(p, t)) { advance(p); return 1; } return 0; }
+
+static void perr(Parser *p, const char *msg) {
+    if (!p->error)  /* report only the first error */
+        fprintf(stderr, "parse error at token %zu (%s): %s\n",
+                p->pos, tok_name(peek(p)->type), msg);
+    p->error = 1;
+}
+static void expect(Parser *p, TokenType t, const char *msg) {
+    if (!match(p, t)) perr(p, msg);
+}
+
+/* [table '.'] column   — an identifier, optionally qualified */
+static ColRef parse_colref(Parser *p) {
+    ColRef c = {0};
+    if (!check(p, TOK_IDENT)) { perr(p, "expected a column name"); return c; }
+    char *first = advance(p)->text;
+    if (match(p, TOK_DOT)) {
+        c.table = strdup(first);
+        if (!check(p, TOK_IDENT)) { perr(p, "expected column after '.'"); return c; }
+        c.column = strdup(advance(p)->text);
+    } else {
+        c.column = strdup(first);
+    }
+    return c;
+}
+
+/* forward decls */
+static Expr *parse_expr(Parser *p);
+
+/* primary = literal | column | '(' expr ')' */
+static Expr *parse_primary(Parser *p) {
+    Expr *e = calloc(1, sizeof(Expr));
+    if (match(p, TOK_LPAREN)) {
+        free(e);
+        Expr *inner = parse_expr(p);
+        expect(p, TOK_RPAREN, "expected ')'");
+        return inner;
+    }
+    if (check(p, TOK_INT)) {
+        e->kind = EXPR_LITERAL; e->literal.type = TYPE_INT;
+        e->literal.as.int_val = strtol(advance(p)->text, NULL, 10); return e;
+    }
+    if (check(p, TOK_FLOAT)) {
+        e->kind = EXPR_LITERAL; e->literal.type = TYPE_FLOAT;
+        e->literal.as.float_val = strtod(advance(p)->text, NULL); return e;
+    }
+    if (check(p, TOK_STRING)) {
+        e->kind = EXPR_LITERAL; e->literal.type = TYPE_STRING;
+        e->literal.as.str_val = strdup(advance(p)->text); return e;
+    }
+    if (match(p, TOK_NULL_KW)) { e->kind = EXPR_LITERAL; e->literal.type = TYPE_NULL; return e; }
+    TokenType t = peek(p)->type;
+    if (t == TOK_COUNT || t == TOK_SUM || t == TOK_AVG || t == TOK_MIN || t == TOK_MAX) {
+        e->kind = EXPR_AGG; e->agg = t; advance(p);
+        expect(p, TOK_LPAREN, "expected '(' after aggregate");
+        if (match(p, TOK_STAR)) e->agg_star = 1;
+        else e->col = parse_colref(p);
+        expect(p, TOK_RPAREN, "expected ')'");
+        return e;
+    }
+    if (check(p, TOK_IDENT)) { e->kind = EXPR_COLUMN; e->col = parse_colref(p); return e; }
+    perr(p, "expected a value or column"); free(e); return NULL;
+}
+
+/* comparison = primary [ (= != < > <= >=) primary ] */
+static Expr *parse_comparison(Parser *p) {
+    Expr *left = parse_primary(p);
+    TokenType t = peek(p)->type;
+    if (t == TOK_EQ || t == TOK_NE || t == TOK_LT || t == TOK_GT ||
+        t == TOK_LE || t == TOK_GE) {
+        advance(p);
+        Expr *e = calloc(1, sizeof(Expr));
+        e->kind = EXPR_BINARY; e->op = t; e->left = left; e->right = parse_primary(p);
+        return e;
+    }
+    return left;
+}
+
+/* and = comparison (AND comparison)* */
+static Expr *parse_and(Parser *p) {
+    Expr *left = parse_comparison(p);
+    while (match(p, TOK_AND)) {
+        Expr *e = calloc(1, sizeof(Expr));
+        e->kind = EXPR_BINARY; e->op = TOK_AND; e->left = left; e->right = parse_comparison(p);
+        left = e;
+    }
+    return left;
+}
+
+/* expr = and (OR and)* */
+static Expr *parse_expr(Parser *p) {
+    Expr *left = parse_and(p);
+    while (match(p, TOK_OR)) {
+        Expr *e = calloc(1, sizeof(Expr));
+        e->kind = EXPR_BINARY; e->op = TOK_OR; e->left = left; e->right = parse_and(p);
+        left = e;
+    }
+    return left;
+}
+
+/* one SELECT item: * | agg '(' (*|col) ')' [AS a] | col [AS a] */
+static SelItem parse_sel_item(Parser *p) {
+    SelItem it = {0};
+    TokenType t = peek(p)->type;
+    if (t == TOK_STAR) { advance(p); it.kind = SEL_STAR; return it; }
+    if (t == TOK_COUNT || t == TOK_SUM || t == TOK_AVG || t == TOK_MIN || t == TOK_MAX) {
+        it.kind = SEL_AGG; it.agg = t; advance(p);
+        expect(p, TOK_LPAREN, "expected '(' after aggregate");
+        if (match(p, TOK_STAR)) it.agg_star = 1;
+        else it.col = parse_colref(p);
+        expect(p, TOK_RPAREN, "expected ')'");
+    } else {
+        it.kind = SEL_COLUMN; it.col = parse_colref(p);
+    }
+    if (match(p, TOK_AS)) {
+        if (check(p, TOK_IDENT)) it.alias = strdup(advance(p)->text);
+        else perr(p, "expected alias after AS");
+    }
+    return it;
+}
+
+/* table_ref = ident [AS ident | ident] ; fills *table and *alias */
+static void parse_table_ref(Parser *p, char **table, char **alias) {
+    if (!check(p, TOK_IDENT)) { perr(p, "expected a table name"); return; }
+    *table = strdup(advance(p)->text);
+    *alias = NULL;
+    if (match(p, TOK_AS)) {
+        if (check(p, TOK_IDENT)) *alias = strdup(advance(p)->text);
+        else perr(p, "expected alias after AS");
+    } else if (check(p, TOK_IDENT)) {
+        *alias = strdup(advance(p)->text);
+    }
+}
+
+static SelectStmt *parse_select(Parser *p) {
+    SelectStmt *s = calloc(1, sizeof(SelectStmt));
+    s->limit = -1;
+
+    expect(p, TOK_SELECT, "expected SELECT");
+
+    /* select list */
+    do {
+        s->items = realloc(s->items, (s->nitems + 1) * sizeof(SelItem));
+        s->items[s->nitems++] = parse_sel_item(p);
+    } while (match(p, TOK_COMMA));
+
+    expect(p, TOK_FROM, "expected FROM");
+    parse_table_ref(p, &s->from_table, &s->from_alias);
+
+    /* joins */
+    while (check(p, TOK_JOIN) || check(p, TOK_INNER) || check(p, TOK_LEFT)) {
+        JoinClause j = {0};
+        j.type = JOIN_INNER;
+        if (match(p, TOK_LEFT))  { j.type = JOIN_LEFT; }
+        else match(p, TOK_INNER);
+        expect(p, TOK_JOIN, "expected JOIN");
+        parse_table_ref(p, &j.table, &j.alias);
+        expect(p, TOK_ON, "expected ON");
+        j.on = parse_expr(p);
+        s->joins = realloc(s->joins, (s->njoins + 1) * sizeof(JoinClause));
+        s->joins[s->njoins++] = j;
+    }
+
+    if (match(p, TOK_WHERE)) s->where = parse_expr(p);
+
+    if (match(p, TOK_GROUP)) {
+        expect(p, TOK_BY, "expected BY after GROUP");
+        do {
+            s->group = realloc(s->group, (s->ngroup + 1) * sizeof(ColRef));
+            s->group[s->ngroup++] = parse_colref(p);
+        } while (match(p, TOK_COMMA));
+        if (match(p, TOK_HAVING)) s->having = parse_expr(p);
+    }
+
+    if (match(p, TOK_ORDER)) {
+        expect(p, TOK_BY, "expected BY after ORDER");
+        do {
+            OrderItem o = {0};
+            o.col = parse_colref(p);
+            if (match(p, TOK_DESC)) o.desc = 1; else match(p, TOK_ASC);
+            s->order = realloc(s->order, (s->norder + 1) * sizeof(OrderItem));
+            s->order[s->norder++] = o;
+        } while (match(p, TOK_COMMA));
+    }
+
+    if (match(p, TOK_LIMIT)) {
+        if (check(p, TOK_INT)) s->limit = strtol(advance(p)->text, NULL, 10);
+        else perr(p, "expected a number after LIMIT");
+    }
+
+    expect(p, TOK_EOF, "unexpected trailing tokens");
+    return s;
+}
+
+/* --- freeing the AST --- */
+static void free_colref(ColRef *c) { free(c->table); free(c->column); }
+static void free_expr(Expr *e) {
+    if (!e) return;
+    if (e->kind == EXPR_COLUMN || e->kind == EXPR_AGG) free_colref(&e->col);
+    if (e->kind == EXPR_LITERAL && e->literal.type == TYPE_STRING) free(e->literal.as.str_val);
+    free_expr(e->left); free_expr(e->right);
+    free(e);
+}
+static void free_select(SelectStmt *s) {
+    if (!s) return;
+    for (size_t i = 0; i < s->nitems; i++) { free_colref(&s->items[i].col); free(s->items[i].alias); }
+    free(s->items);
+    free(s->from_table); free(s->from_alias);
+    for (size_t i = 0; i < s->njoins; i++) { free(s->joins[i].table); free(s->joins[i].alias); free_expr(s->joins[i].on); }
+    free(s->joins);
+    free_expr(s->where);
+    for (size_t i = 0; i < s->ngroup; i++) free_colref(&s->group[i]);
+    free(s->group);
+    free_expr(s->having);
+    for (size_t i = 0; i < s->norder; i++) free_colref(&s->order[i].col);
+    free(s->order);
+    free(s);
+}
+
+/* Parse a SQL string into a SelectStmt (NULL on error). */
+static SelectStmt *parse_sql(const char *sql) {
+    TokenList tl = tokenize(sql);
+    Parser p = { &tl, 0, 0 };
+    SelectStmt *s = parse_select(&p);
+    tl_free(&tl);
+    if (p.error) { free_select(s); return NULL; }
+    return s;
+}
+
+/* --- debug printer for the AST --- */
+static void print_colref(const ColRef *c) {
+    if (c->table) printf("%s.", c->table);
+    printf("%s", c->column ? c->column : "?");
+}
+static void print_expr(const Expr *e) {
+    if (!e) { printf("(null)"); return; }
+    switch (e->kind) {
+        case EXPR_COLUMN: print_colref(&e->col); break;
+        case EXPR_LITERAL: {
+            char b[128]; value_str(&e->literal, b, sizeof b);
+            if (e->literal.type == TYPE_STRING) printf("'%s'", b); else printf("%s", b);
+            break;
+        }
+        case EXPR_BINARY:
+            printf("("); print_expr(e->left);
+            printf(" %s ", tok_name(e->op));
+            print_expr(e->right); printf(")");
+            break;
+        case EXPR_AGG:
+            printf("%s(", tok_name(e->agg));
+            if (e->agg_star) printf("*"); else print_colref(&e->col);
+            printf(")");
+            break;
+    }
+}
+static void print_ast(const SelectStmt *s) {
+    printf("SELECT ");
+    for (size_t i = 0; i < s->nitems; i++) {
+        if (i) printf(", ");
+        SelItem *it = &s->items[i];
+        if (it->kind == SEL_STAR) printf("*");
+        else if (it->kind == SEL_AGG) {
+            printf("%s(", tok_name(it->agg));
+            if (it->agg_star) printf("*"); else print_colref(&it->col);
+            printf(")");
+        } else print_colref(&it->col);
+        if (it->alias) printf(" AS %s", it->alias);
+    }
+    printf("\n  FROM %s", s->from_table);
+    if (s->from_alias) printf(" %s", s->from_alias);
+    for (size_t i = 0; i < s->njoins; i++) {
+        printf("\n  %s JOIN %s", s->joins[i].type == JOIN_LEFT ? "LEFT" : "INNER", s->joins[i].table);
+        if (s->joins[i].alias) printf(" %s", s->joins[i].alias);
+        printf(" ON "); print_expr(s->joins[i].on);
+    }
+    if (s->where) { printf("\n  WHERE "); print_expr(s->where); }
+    if (s->ngroup) {
+        printf("\n  GROUP BY ");
+        for (size_t i = 0; i < s->ngroup; i++) { if (i) printf(", "); print_colref(&s->group[i]); }
+    }
+    if (s->having) { printf("\n  HAVING "); print_expr(s->having); }
+    if (s->norder) {
+        printf("\n  ORDER BY ");
+        for (size_t i = 0; i < s->norder; i++) {
+            if (i) printf(", ");
+            print_colref(&s->order[i].col);
+            printf(s->order[i].desc ? " DESC" : " ASC");
+        }
+    }
+    if (s->limit >= 0) printf("\n  LIMIT %ld", s->limit);
+    printf("\n");
+}
+
+/* ===========================================================================
+ * STEP 4-7 — EXECUTOR: run an AST against loaded tables, producing a result.
+ *
+ * We execute over an intermediate relation `Rel` (like Table, but each column
+ * remembers which table/alias it came from, so qualified refs like a.id work).
+ * The logical pipeline: FROM -> JOIN -> WHERE -> GROUP/aggregate -> HAVING ->
+ * project (SELECT) -> ORDER BY -> LIMIT.
+ * ========================================================================= */
+typedef struct { char *qualifier; char *name; ColumnType type; } ColMeta;
+typedef struct { ColMeta *cols; size_t ncols; Row *rows; size_t nrows, cap; } Rel;
+
+static Value value_dup(const Value *v) {
+    Value o = *v;
+    if (v->type == TYPE_STRING) o.as.str_val = strdup(v->as.str_val);
+    return o;
+}
+static int is_true(Value v) {
+    return (v.type == TYPE_INT   && v.as.int_val   != 0) ||
+           (v.type == TYPE_FLOAT && v.as.float_val != 0);
+}
+/* Compare two values. Returns 0 if incomparable (either NULL, or string vs
+ * number); otherwise returns 1 and sets *out to -1/0/1. */
+static int value_compare(const Value *a, const Value *b, int *out) {
+    if (a->type == TYPE_NULL || b->type == TYPE_NULL) return 0;
+    int as = a->type == TYPE_STRING, bs = b->type == TYPE_STRING;
+    if (as != bs) return 0;                       /* string vs number */
+    if (as) { int c = strcmp(a->as.str_val, b->as.str_val);
+              *out = c < 0 ? -1 : (c > 0 ? 1 : 0); return 1; }
+    double x = a->type == TYPE_FLOAT ? a->as.float_val : (double)a->as.int_val;
+    double y = b->type == TYPE_FLOAT ? b->as.float_val : (double)b->as.int_val;
+    *out = x < y ? -1 : (x > y ? 1 : 0); return 1;
+}
+
+static void rel_add_row(Rel *r, Row row) {
+    if (r->nrows == r->cap) { r->cap = r->cap ? r->cap * 2 : 16;
+                              r->rows = realloc(r->rows, r->cap * sizeof(Row)); }
+    r->rows[r->nrows++] = row;
+}
+static void rel_free(Rel *r) {
+    for (size_t i = 0; i < r->ncols; i++) { free(r->cols[i].qualifier); free(r->cols[i].name); }
+    free(r->cols);
+    for (size_t i = 0; i < r->nrows; i++) {
+        for (size_t j = 0; j < r->rows[i].count; j++)
+            if (r->rows[i].values[j].type == TYPE_STRING) free(r->rows[i].values[j].as.str_val);
+        free(r->rows[i].values);
+    }
+    free(r->rows);
+    memset(r, 0, sizeof *r);
+}
+static void copy_schema(Rel *dst, const Rel *src) {
+    dst->ncols = src->ncols;
+    dst->cols = malloc(dst->ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < dst->ncols; i++) {
+        dst->cols[i].qualifier = src->cols[i].qualifier ? strdup(src->cols[i].qualifier) : NULL;
+        dst->cols[i].name = strdup(src->cols[i].name);
+        dst->cols[i].type = src->cols[i].type;
+    }
+}
+/* Find a column by (optional qualifier + name). -1 if absent or ambiguous. */
+static int rel_find_col(const Rel *r, const ColRef *c) {
+    int found = -1;
+    for (size_t i = 0; i < r->ncols; i++) {
+        if (strcmp(r->cols[i].name, c->column) != 0) continue;
+        if (c->table && (!r->cols[i].qualifier || strcmp(r->cols[i].qualifier, c->table) != 0)) continue;
+        if (found >= 0) return -1;                /* ambiguous */
+        found = (int)i;
+    }
+    return found;
+}
+
+/* Row-level expression evaluation (WHERE, JOIN ON). Returned Values BORROW any
+ * string pointers from the row/expr — never free them. */
+static Value eval_expr(const Expr *e, const Rel *r, const Row *row) {
+    Value v; v.type = TYPE_NULL;
+    switch (e->kind) {
+        case EXPR_LITERAL: return e->literal;
+        case EXPR_COLUMN: {
+            int idx = rel_find_col(r, &e->col);
+            return idx < 0 ? v : row->values[idx];
+        }
+        case EXPR_BINARY: {
+            if (e->op == TOK_AND || e->op == TOK_OR) {
+                int l = is_true(eval_expr(e->left, r, row));
+                int rr = is_true(eval_expr(e->right, r, row));
+                v.type = TYPE_INT; v.as.int_val = e->op == TOK_AND ? (l && rr) : (l || rr);
+                return v;
+            }
+            Value a = eval_expr(e->left, r, row), b = eval_expr(e->right, r, row);
+            int cmp; if (!value_compare(&a, &b, &cmp)) return v;   /* NULL */
+            int res = 0;
+            switch (e->op) {
+                case TOK_EQ: res = cmp == 0; break; case TOK_NE: res = cmp != 0; break;
+                case TOK_LT: res = cmp <  0; break; case TOK_GT: res = cmp >  0; break;
+                case TOK_LE: res = cmp <= 0; break; case TOK_GE: res = cmp >= 0; break;
+                default: break;
+            }
+            v.type = TYPE_INT; v.as.int_val = res; return v;
+        }
+        case EXPR_AGG: return v;                  /* not valid at row level */
+    }
+    return v;
+}
+
+/* Compute an aggregate over a group's rows. */
+static Value eval_agg(TokenType agg, int star, const ColRef *arg,
+                      const Rel *r, Row **rows, size_t nrows) {
+    Value out; out.type = TYPE_NULL;
+    if (agg == TOK_COUNT) {
+        long cnt = 0;
+        if (star) cnt = (long)nrows;
+        else { int idx = rel_find_col(r, arg);
+               if (idx >= 0) for (size_t i = 0; i < nrows; i++)
+                   if (rows[i]->values[idx].type != TYPE_NULL) cnt++; }
+        out.type = TYPE_INT; out.as.int_val = cnt; return out;
+    }
+    int idx = star ? -1 : rel_find_col(r, arg);
+    ColumnType at = idx >= 0 ? r->cols[idx].type : TYPE_INT;
+    double acc = 0, mn = 0, mx = 0; long cnt = 0; int have = 0;
+    if (idx >= 0) for (size_t i = 0; i < nrows; i++) {
+        Value *val = &rows[i]->values[idx];
+        if (val->type == TYPE_NULL) continue;
+        double d = val->type == TYPE_FLOAT ? val->as.float_val : (double)val->as.int_val;
+        if (!have) { mn = mx = d; have = 1; } else { if (d < mn) mn = d; if (d > mx) mx = d; }
+        acc += d; cnt++;
+    }
+    switch (agg) {
+        case TOK_SUM: if (at == TYPE_FLOAT) { out.type = TYPE_FLOAT; out.as.float_val = acc; }
+                      else { out.type = TYPE_INT; out.as.int_val = (long)acc; } break;
+        case TOK_AVG: out.type = TYPE_FLOAT; out.as.float_val = cnt ? acc / cnt : 0; break;
+        case TOK_MIN: case TOK_MAX: {
+            if (!have) break;                     /* stays NULL */
+            double m = agg == TOK_MIN ? mn : mx;
+            if (at == TYPE_FLOAT) { out.type = TYPE_FLOAT; out.as.float_val = m; }
+            else { out.type = TYPE_INT; out.as.int_val = (long)m; } break;
+        }
+        default: break;
+    }
+    return out;
+}
+
+/* Group-aware evaluation (HAVING): aggregates over the group, columns from
+ * the group's first row. */
+static Value eval_group(const Expr *e, const Rel *r, Row **rows, size_t nrows) {
+    Value v; v.type = TYPE_NULL;
+    switch (e->kind) {
+        case EXPR_LITERAL: return e->literal;
+        case EXPR_AGG: return eval_agg(e->agg, e->agg_star, &e->col, r, rows, nrows);
+        case EXPR_COLUMN: {
+            int idx = rel_find_col(r, &e->col);
+            return (idx < 0 || nrows == 0) ? v : rows[0]->values[idx];
+        }
+        case EXPR_BINARY: {
+            if (e->op == TOK_AND || e->op == TOK_OR) {
+                int l = is_true(eval_group(e->left, r, rows, nrows));
+                int rr = is_true(eval_group(e->right, r, rows, nrows));
+                v.type = TYPE_INT; v.as.int_val = e->op == TOK_AND ? (l && rr) : (l || rr);
+                return v;
+            }
+            Value a = eval_group(e->left, r, rows, nrows), b = eval_group(e->right, r, rows, nrows);
+            int cmp; if (!value_compare(&a, &b, &cmp)) return v;
+            int res = 0;
+            switch (e->op) {
+                case TOK_EQ: res = cmp == 0; break; case TOK_NE: res = cmp != 0; break;
+                case TOK_LT: res = cmp <  0; break; case TOK_GT: res = cmp >  0; break;
+                case TOK_LE: res = cmp <= 0; break; case TOK_GE: res = cmp >= 0; break;
+                default: break;
+            }
+            v.type = TYPE_INT; v.as.int_val = res; return v;
+        }
+    }
+    return v;
+}
+
+/* --- FROM: copy a stored Table into a Rel, tagging columns with a qualifier. */
+static Rel rel_from_table(const Table *t, const char *qual) {
+    Rel r = {0};
+    r.ncols = t->col_count;
+    r.cols = malloc(r.ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < r.ncols; i++) {
+        r.cols[i].qualifier = qual ? strdup(qual) : NULL;
+        r.cols[i].name = strdup(t->col_names[i]);
+        r.cols[i].type = t->col_types[i];
+    }
+    for (size_t i = 0; i < t->row_count; i++) {
+        Row row; row.count = t->col_count; row.values = malloc(row.count * sizeof(Value));
+        for (size_t j = 0; j < row.count; j++) row.values[j] = value_dup(&t->rows[i].values[j]);
+        rel_add_row(&r, row);
+    }
+    return r;
+}
+
+/* Like rel_from_table, but only the given `rowidx` rows (an index lookup gave
+ * us these) — so we copy just the matches instead of the whole table. */
+static Rel rel_from_table_rows(const Table *t, const char *qual, const size_t *rowidx, size_t n) {
+    Rel r = {0};
+    r.ncols = t->col_count;
+    r.cols = malloc(r.ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < r.ncols; i++) {
+        r.cols[i].qualifier = qual ? strdup(qual) : NULL;
+        r.cols[i].name = strdup(t->col_names[i]);
+        r.cols[i].type = t->col_types[i];
+    }
+    for (size_t k = 0; k < n; k++) {
+        size_t i = rowidx[k];
+        Row row; row.count = t->col_count; row.values = malloc(row.count * sizeof(Value));
+        for (size_t j = 0; j < row.count; j++) row.values[j] = value_dup(&t->rows[i].values[j]);
+        rel_add_row(&r, row);
+    }
+    return r;
+}
+
+/* --- JOIN: nested-loop inner/left join of two relations on a predicate. */
+static Rel join_rel(const Rel *L, const Rel *R, const Expr *on, JoinType type) {
+    Rel out = {0};
+    out.ncols = L->ncols + R->ncols;
+    out.cols = malloc(out.ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < L->ncols; i++) {
+        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+    }
+    for (size_t i = 0; i < R->ncols; i++) {
+        size_t o = L->ncols + i;
+        out.cols[o].qualifier = R->cols[i].qualifier ? strdup(R->cols[i].qualifier) : NULL;
+        out.cols[o].name = strdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
+    }
+    Row tmp; tmp.count = out.ncols; tmp.values = malloc(out.ncols * sizeof(Value));
+    for (size_t li = 0; li < L->nrows; li++) {
+        int matched = 0;
+        for (size_t k = 0; k < L->ncols; k++) tmp.values[k] = L->rows[li].values[k];
+        for (size_t ri = 0; ri < R->nrows; ri++) {
+            for (size_t k = 0; k < R->ncols; k++) tmp.values[L->ncols + k] = R->rows[ri].values[k];
+            if (is_true(eval_expr(on, &out, &tmp))) {
+                Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+                for (size_t k = 0; k < out.ncols; k++) row.values[k] = value_dup(&tmp.values[k]);
+                rel_add_row(&out, row); matched = 1;
+            }
+        }
+        if (type == JOIN_LEFT && !matched) {
+            Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+            for (size_t k = 0; k < L->ncols; k++) row.values[k] = value_dup(&L->rows[li].values[k]);
+            for (size_t k = 0; k < R->ncols; k++) row.values[L->ncols + k].type = TYPE_NULL;
+            rel_add_row(&out, row);
+        }
+    }
+    free(tmp.values);
+    return out;
+}
+
+/* --- HASH JOIN: O(n+m) equijoin. Build a hash table on the right relation's
+ * key column, then probe it with each left row. Only usable when the ON clause
+ * is a single equality between a left column and a right column of equal type
+ * (checked by equijoin_keys); otherwise we fall back to nested-loop. */
+static unsigned long value_hash(const Value *v) {
+    if (v->type == TYPE_STRING) {                 /* djb2 */
+        unsigned long h = 5381; const unsigned char *s = (const unsigned char *)v->as.str_val;
+        while (*s) h = ((h << 5) + h) + *s++;
+        return h;
+    }
+    if (v->type == TYPE_INT)   return (unsigned long)v->as.int_val * 1099511628211UL;
+    if (v->type == TYPE_FLOAT) { double d = v->as.float_val; unsigned long u = 0;
+                                 memcpy(&u, &d, sizeof d); return u * 1099511628211UL; }
+    return 0;
+}
+
+/* ===========================================================================
+ * SECONDARY INDEXES (experiment): two designs on a single column.
+ *   HASH   — value -> bucket of row indices. O(1) average equality lookup.
+ *            Cannot answer range queries (no order).
+ *   SORTED — row indices sorted by the column's value. O(log n) equality AND
+ *            range (<, >, <=, >=) via binary search. Costs a sort to build.
+ * Both are secondary indexes over an existing in-memory Table (no persistence).
+ * ========================================================================= */
+typedef enum { IDX_HASH, IDX_SORTED } IndexKind;
+typedef struct IdxNode { unsigned long h; size_t row; struct IdxNode *next; } IdxNode;
+typedef struct Index {
+    int        col;
+    IndexKind  kind;
+    /* HASH */
+    IdxNode  **buckets;
+    size_t     nbuckets;
+    IdxNode   *pool;          /* one node per row, contiguous */
+    /* SORTED */
+    size_t    *sorted;        /* row indices, ascending by column value */
+    size_t     nsorted;
+} Index;
+
+/* table_free routes here (declared up by the Table definition). */
+static void indexes_free(Index *arr, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        free(arr[i].buckets); free(arr[i].pool); free(arr[i].sorted);
+    }
+    free(arr);
+}
+
+/* --- sorting a column's row indices (for SORTED, and shared compare) --- */
+static const Table *g_ix_tbl; static int g_ix_col;
+static int idx_row_cmp(const void *pa, const void *pb) {
+    size_t ra = *(const size_t *)pa, rb = *(const size_t *)pb;
+    const Value *a = &g_ix_tbl->rows[ra].values[g_ix_col];
+    const Value *b = &g_ix_tbl->rows[rb].values[g_ix_col];
+    if (a->type == TYPE_NULL && b->type == TYPE_NULL) return 0;
+    if (a->type == TYPE_NULL) return -1;
+    if (b->type == TYPE_NULL) return 1;
+    int c; return value_compare(a, b, &c) ? c : 0;
+}
+
+/* Build (or rebuild) an index of `kind` on column `col` of table `t`. */
+static void table_add_index(Table *t, int col, IndexKind kind) {
+    /* replace if one of the same (col,kind) already exists */
+    for (size_t i = 0; i < t->nindex; i++)
+        if (t->indexes[i].col == col && t->indexes[i].kind == kind) return;
+
+    t->indexes = realloc(t->indexes, (t->nindex + 1) * sizeof(Index));
+    Index *ix = &t->indexes[t->nindex++];
+    memset(ix, 0, sizeof *ix);
+    ix->col = col; ix->kind = kind;
+
+    if (kind == IDX_HASH) {
+        size_t nb = 16; while (nb < t->row_count) nb <<= 1;
+        ix->nbuckets = nb;
+        ix->buckets = calloc(nb, sizeof(IdxNode *));
+        ix->pool = t->row_count ? malloc(t->row_count * sizeof(IdxNode)) : NULL;
+        for (size_t r = t->row_count; r-- > 0; ) {   /* descending -> ascending chains */
+            Value *v = &t->rows[r].values[col];
+            if (v->type == TYPE_NULL) continue;
+            unsigned long h = value_hash(v); size_t b = h & (nb - 1);
+            ix->pool[r].h = h; ix->pool[r].row = r;
+            ix->pool[r].next = ix->buckets[b]; ix->buckets[b] = &ix->pool[r];
+        }
+    } else {   /* IDX_SORTED */
+        ix->sorted = malloc((t->row_count ? t->row_count : 1) * sizeof(size_t));
+        ix->nsorted = 0;
+        for (size_t r = 0; r < t->row_count; r++)
+            if (t->rows[r].values[col].type != TYPE_NULL) ix->sorted[ix->nsorted++] = r;
+        g_ix_tbl = t; g_ix_col = col;
+        qsort(ix->sorted, ix->nsorted, sizeof(size_t), idx_row_cmp);
+    }
+}
+
+static Index *table_find_index(Table *t, int col, int want_range) {
+    /* range queries need a SORTED index; equality can use either (prefer hash) */
+    Index *hash = NULL, *sorted = NULL;
+    for (size_t i = 0; i < t->nindex; i++) {
+        if (t->indexes[i].col != col) continue;
+        if (t->indexes[i].kind == IDX_HASH)   hash = &t->indexes[i];
+        if (t->indexes[i].kind == IDX_SORTED) sorted = &t->indexes[i];
+    }
+    if (want_range) return sorted;
+    return hash ? hash : sorted;
+}
+
+/* Lookup rows where column `col` OP `key`. Fills *out (malloc'd) with matching
+ * row indices, returns the count. op is a comparison TokenType. */
+static size_t index_lookup(Table *t, Index *ix, TokenType op, const Value *key, size_t **out) {
+    size_t cap = 16, n = 0; size_t *res = malloc(cap * sizeof(size_t));
+    #define PUSH(R) do { if (n==cap){cap*=2;res=realloc(res,cap*sizeof(size_t));} res[n++]=(R); } while(0)
+
+    if (ix->kind == IDX_HASH) {                 /* equality only */
+        unsigned long h = value_hash(key); size_t b = h & (ix->nbuckets - 1);
+        for (IdxNode *nd = ix->buckets[b]; nd; nd = nd->next) {
+            if (nd->h != h) continue;
+            int c; Value *v = &t->rows[nd->row].values[ix->col];
+            if (value_compare(v, key, &c) && c == 0) PUSH(nd->row);
+        }
+    } else {                                    /* SORTED: binary search a range */
+        /* find first index whose value >= key (lower bound) */
+        size_t lo = 0, hi = ix->nsorted;
+        while (lo < hi) { size_t mid = (lo + hi) / 2;
+            Value *v = &t->rows[ix->sorted[mid]].values[ix->col];
+            int c; int cmp = value_compare(v, key, &c) ? c : 0;
+            if (cmp < 0) lo = mid + 1; else hi = mid; }
+        size_t lb = lo;
+        /* upper bound: first index whose value > key */
+        lo = 0; hi = ix->nsorted;
+        while (lo < hi) { size_t mid = (lo + hi) / 2;
+            Value *v = &t->rows[ix->sorted[mid]].values[ix->col];
+            int c; int cmp = value_compare(v, key, &c) ? c : 0;
+            if (cmp <= 0) lo = mid + 1; else hi = mid; }
+        size_t ub = lo;
+        size_t start, end;
+        switch (op) {
+            case TOK_EQ: start = lb; end = ub; break;
+            case TOK_LT: start = 0;  end = lb; break;
+            case TOK_LE: start = 0;  end = ub; break;
+            case TOK_GT: start = ub; end = ix->nsorted; break;
+            case TOK_GE: start = lb; end = ix->nsorted; break;
+            default:     start = 0;  end = 0; break;
+        }
+        for (size_t i = start; i < end; i++) PUSH(ix->sorted[i]);
+    }
+    #undef PUSH
+    *out = res; return n;
+}
+
+/* If `on` is `Lcol = Rcol` (in either order) with matching column types, fill
+ * the left/right key indices and return 1. Otherwise return 0. */
+static int equijoin_keys(const Expr *on, const Rel *L, const Rel *R, int *lk, int *rk) {
+    if (!on || on->kind != EXPR_BINARY || on->op != TOK_EQ) return 0;
+    if (on->left->kind != EXPR_COLUMN || on->right->kind != EXPR_COLUMN) return 0;
+    int l1 = rel_find_col(L, &on->left->col),  r1 = rel_find_col(R, &on->right->col);
+    int l2 = rel_find_col(L, &on->right->col), r2 = rel_find_col(R, &on->left->col);
+    if (l1 >= 0 && r1 >= 0)      { *lk = l1; *rk = r1; }
+    else if (l2 >= 0 && r2 >= 0) { *lk = l2; *rk = r2; }
+    else return 0;
+    if (L->cols[*lk].type != R->cols[*rk].type) return 0;   /* type mismatch: use nested-loop */
+    return 1;
+}
+
+typedef struct HNode { unsigned long h; size_t idx; struct HNode *next; } HNode;
+
+static Rel join_hash(const Rel *L, const Rel *R, int lk, int rk, JoinType type) {
+    Rel out = {0};
+    out.ncols = L->ncols + R->ncols;
+    out.cols = malloc(out.ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < L->ncols; i++) {
+        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+    }
+    for (size_t i = 0; i < R->ncols; i++) {
+        size_t o = L->ncols + i;
+        out.cols[o].qualifier = R->cols[i].qualifier ? strdup(R->cols[i].qualifier) : NULL;
+        out.cols[o].name = strdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
+    }
+
+    /* Build phase: hash every right row by its key (NULL keys never match). */
+    size_t nb = 16; while (nb < R->nrows) nb <<= 1;
+    HNode **buckets = calloc(nb, sizeof(HNode *));
+    HNode *pool = R->nrows ? malloc(R->nrows * sizeof(HNode)) : NULL;
+    /* insert descending so each bucket chain ends up ascending by row index,
+       matching nested-loop's output order for identical results */
+    for (size_t ri = R->nrows; ri-- > 0; ) {
+        Value *k = &R->rows[ri].values[rk];
+        if (k->type == TYPE_NULL) continue;
+        unsigned long h = value_hash(k);
+        size_t b = h & (nb - 1);
+        pool[ri].h = h; pool[ri].idx = ri; pool[ri].next = buckets[b]; buckets[b] = &pool[ri];
+    }
+
+    /* Probe phase: for each left row, look up matches in O(1) average. */
+    Row tmp; tmp.count = out.ncols; tmp.values = malloc(out.ncols * sizeof(Value));
+    for (size_t li = 0; li < L->nrows; li++) {
+        for (size_t k = 0; k < L->ncols; k++) tmp.values[k] = L->rows[li].values[k];
+        int matched = 0;
+        Value *key = &L->rows[li].values[lk];
+        if (key->type != TYPE_NULL) {
+            unsigned long h = value_hash(key); size_t b = h & (nb - 1);
+            for (HNode *n = buckets[b]; n; n = n->next) {
+                if (n->h != h) continue;
+                int cmp; Value *rkey = &R->rows[n->idx].values[rk];
+                if (!value_compare(key, rkey, &cmp) || cmp != 0) continue;
+                for (size_t k = 0; k < R->ncols; k++) tmp.values[L->ncols + k] = R->rows[n->idx].values[k];
+                Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+                for (size_t k = 0; k < out.ncols; k++) row.values[k] = value_dup(&tmp.values[k]);
+                rel_add_row(&out, row); matched = 1;
+            }
+        }
+        if (type == JOIN_LEFT && !matched) {
+            Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+            for (size_t k = 0; k < L->ncols; k++) row.values[k] = value_dup(&L->rows[li].values[k]);
+            for (size_t k = 0; k < R->ncols; k++) row.values[L->ncols + k].type = TYPE_NULL;
+            rel_add_row(&out, row);
+        }
+    }
+    free(tmp.values); free(pool); free(buckets);
+    return out;
+}
+
+/* Join-algorithm policy: 0=auto (hash when possible), 1=force nested, 2=force hash. */
+static int g_join_mode = 0;
+static int g_auto_index = 0;   /* when on, build an index on a base filter column on first use */
+static int g_used_index = 0;   /* set per-query if an index served the base scan (for EXPLAIN/report) */
+static int g_timer = 0;        /* .timer: print per-query execution time */
+
+/* Pick and run the best join algorithm; report which via *algo. */
+static Rel join_dispatch(const Rel *L, const Rel *R, const Expr *on, JoinType type, const char **algo) {
+    int lk = 0, rk = 0;
+    int equi = equijoin_keys(on, L, R, &lk, &rk);
+    int use_hash = (g_join_mode == 1) ? 0 : equi;   /* auto & force-hash both need an equijoin */
+    if (use_hash) { if (algo) *algo = "hash"; return join_hash(L, R, lk, rk, type); }
+    if (algo) *algo = "nested-loop";
+    return join_rel(L, R, on, type);
+}
+
+static Rel rel_schema_only(const Table *t, const char *qual);   /* defined with EXPLAIN */
+
+/* --- INDEX JOIN: join left Rel `L` against a base table `rt` that has a hash
+ * index `ix` on its join column `rk`. For each left row we probe the index and
+ * emit only the matching right rows — WITHOUT copying the whole right table.
+ * A big win when L is small (e.g. after a selective filter) and rt is large. */
+static Rel join_index(const Rel *L, const Table *rt, const char *rq,
+                      int lk, int rk, const Index *ix, JoinType type) {
+    Rel out = {0};
+    out.ncols = L->ncols + rt->col_count;
+    out.cols = malloc(out.ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < L->ncols; i++) {
+        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+    }
+    for (size_t i = 0; i < rt->col_count; i++) { size_t o = L->ncols + i;
+        out.cols[o].qualifier = rq ? strdup(rq) : NULL;
+        out.cols[o].name = strdup(rt->col_names[i]); out.cols[o].type = rt->col_types[i];
+    }
+
+    Row tmp; tmp.count = out.ncols; tmp.values = malloc(out.ncols * sizeof(Value));
+    for (size_t li = 0; li < L->nrows; li++) {
+        for (size_t k = 0; k < L->ncols; k++) tmp.values[k] = L->rows[li].values[k];
+        int matched = 0;
+        Value *key = &L->rows[li].values[lk];
+        if (key->type != TYPE_NULL) {
+            unsigned long h = value_hash(key); size_t b = h & (ix->nbuckets - 1);
+            for (IdxNode *n = ix->buckets[b]; n; n = n->next) {
+                if (n->h != h) continue;
+                int cmp; Value *rkey = &rt->rows[n->row].values[rk];
+                if (!value_compare(key, rkey, &cmp) || cmp != 0) continue;
+                for (size_t k = 0; k < rt->col_count; k++) tmp.values[L->ncols + k] = rt->rows[n->row].values[k];
+                Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+                for (size_t k = 0; k < out.ncols; k++) row.values[k] = value_dup(&tmp.values[k]);
+                rel_add_row(&out, row); matched = 1;
+            }
+        }
+        if (type == JOIN_LEFT && !matched) {
+            Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+            for (size_t k = 0; k < L->ncols; k++) row.values[k] = value_dup(&L->rows[li].values[k]);
+            for (size_t k = 0; k < rt->col_count; k++) row.values[L->ncols + k].type = TYPE_NULL;
+            rel_add_row(&out, row);
+        }
+    }
+    free(tmp.values);
+    return out;
+}
+
+/* --- WHERE: keep rows for which the predicate is true. */
+static Rel filter_rel(const Rel *in, const Expr *where) {
+    Rel out = {0}; copy_schema(&out, in);
+    for (size_t i = 0; i < in->nrows; i++)
+        if (is_true(eval_expr(where, in, &in->rows[i]))) {
+            Row row; row.count = in->ncols; row.values = malloc(row.count * sizeof(Value));
+            for (size_t j = 0; j < row.count; j++) row.values[j] = value_dup(&in->rows[i].values[j]);
+            rel_add_row(&out, row);
+        }
+    return out;
+}
+
+/* Build the output column schema for the SELECT list against input rel `in`. */
+static void out_schema(const SelectStmt *s, const Rel *in, ColMeta **cols, size_t *ncols) {
+    ColMeta *c = NULL; size_t n = 0;
+    for (size_t i = 0; i < s->nitems; i++) {
+        SelItem *it = &s->items[i];
+        if (it->kind == SEL_STAR) {
+            for (size_t k = 0; k < in->ncols; k++) {
+                c = realloc(c, (n + 1) * sizeof(ColMeta));
+                c[n].qualifier = in->cols[k].qualifier ? strdup(in->cols[k].qualifier) : NULL;
+                c[n].name = strdup(in->cols[k].name); c[n].type = in->cols[k].type; n++;
+            }
+        } else if (it->kind == SEL_COLUMN) {
+            int idx = rel_find_col(in, &it->col);
+            c = realloc(c, (n + 1) * sizeof(ColMeta));
+            /* keep the qualifier so ORDER BY / HAVING can still find it by t.col */
+            c[n].qualifier = it->col.table ? strdup(it->col.table)
+                           : (idx >= 0 && in->cols[idx].qualifier ? strdup(in->cols[idx].qualifier) : NULL);
+            c[n].name = strdup(it->alias ? it->alias : it->col.column);
+            c[n].type = idx >= 0 ? in->cols[idx].type : TYPE_NULL; n++;
+        } else {   /* SEL_AGG */
+            int idx = it->agg_star ? -1 : rel_find_col(in, &it->col);
+            ColumnType at = idx >= 0 ? in->cols[idx].type : TYPE_INT;
+            ColumnType rt = it->agg == TOK_COUNT ? TYPE_INT :
+                            it->agg == TOK_AVG   ? TYPE_FLOAT : at;
+            c = realloc(c, (n + 1) * sizeof(ColMeta));
+            c[n].qualifier = NULL;
+            c[n].name = strdup(it->alias ? it->alias : tok_name(it->agg));
+            c[n].type = rt; n++;
+        }
+    }
+    *cols = c; *ncols = n;
+}
+
+/* --- projection with no aggregation: one output row per input row. */
+static Rel project_plain(const SelectStmt *s, const Rel *in) {
+    Rel out = {0};
+    out_schema(s, in, &out.cols, &out.ncols);
+    for (size_t i = 0; i < in->nrows; i++) {
+        Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+        size_t vi = 0;
+        for (size_t k = 0; k < s->nitems; k++) {
+            SelItem *it = &s->items[k];
+            if (it->kind == SEL_STAR)
+                for (size_t j = 0; j < in->ncols; j++) row.values[vi++] = value_dup(&in->rows[i].values[j]);
+            else {   /* SEL_COLUMN (aggregation path handles SEL_AGG) */
+                int idx = rel_find_col(in, &it->col);
+                Value nv; nv.type = TYPE_NULL;
+                row.values[vi++] = idx >= 0 ? value_dup(&in->rows[i].values[idx]) : nv;
+            }
+        }
+        rel_add_row(&out, row);
+    }
+    return out;
+}
+
+/* --- GROUP BY + aggregates (+ HAVING). ngroup==0 means one group = all rows. */
+typedef struct { Row **rows; size_t nrows, cap; } Group;
+typedef struct GNode { unsigned long h; size_t gi; struct GNode *next; } GNode;
+
+/* Hash a row's group-key values together (order-sensitive FNV-1a mix). */
+static unsigned long group_hash(const Row *row, const int *gidx, size_t ng) {
+    unsigned long h = 1469598103934665603UL;
+    for (size_t k = 0; k < ng; k++) {
+        int idx = gidx[k]; if (idx < 0) continue;
+        const Value *v = &row->values[idx];
+        h ^= (v->type == TYPE_NULL) ? 0 : value_hash(v);
+        h *= 1099511628211UL;
+    }
+    return h;
+}
+
+static Rel aggregate(const SelectStmt *s, const Rel *in) {
+    /* Bucket rows into groups using a hash table on the group-key values.
+       A linear search over existing groups would be O(rows * groups) —
+       catastrophic for high-cardinality keys — so we hash instead (~O(rows)). */
+    Group *groups = NULL; size_t ng = 0, gcap = 0;
+    int *gidx = malloc(s->ngroup * sizeof(int));
+    for (size_t k = 0; k < s->ngroup; k++) gidx[k] = rel_find_col(in, &s->group[k]);
+
+    size_t nb = 1024; while (nb < in->nrows) nb <<= 1;   /* power of two */
+    GNode **buckets = calloc(nb, sizeof(GNode *));
+
+    for (size_t i = 0; i < in->nrows; i++) {
+        unsigned long h = group_hash(&in->rows[i], gidx, s->ngroup);
+        size_t b = h & (nb - 1);
+        long g = -1;
+        for (GNode *n = buckets[b]; n; n = n->next) {
+            if (n->h != h) continue;
+            int same = 1;                                /* confirm on hash hit */
+            for (size_t k = 0; k < s->ngroup; k++) {
+                int idx = gidx[k]; if (idx < 0) continue;
+                int cmp; Value *a = &in->rows[i].values[idx];
+                Value *bb = &groups[n->gi].rows[0]->values[idx];
+                if (a->type == TYPE_NULL && bb->type == TYPE_NULL) continue;
+                if (!value_compare(a, bb, &cmp) || cmp != 0) { same = 0; break; }
+            }
+            if (same) { g = (long)n->gi; break; }
+        }
+        if (g < 0) {   /* new group */
+            if (ng == gcap) { gcap = gcap ? gcap * 2 : 16; groups = realloc(groups, gcap * sizeof(Group)); }
+            groups[ng].rows = NULL; groups[ng].nrows = 0; groups[ng].cap = 0;
+            GNode *node = malloc(sizeof(GNode));
+            node->h = h; node->gi = ng; node->next = buckets[b]; buckets[b] = node;
+            g = (long)ng++;
+        }
+        Group *grp = &groups[g];
+        if (grp->nrows == grp->cap) { grp->cap = grp->cap ? grp->cap * 2 : 8;
+                                      grp->rows = realloc(grp->rows, grp->cap * sizeof(Row *)); }
+        grp->rows[grp->nrows++] = &in->rows[i];
+    }
+    for (size_t b = 0; b < nb; b++)                      /* free the hash index */
+        for (GNode *n = buckets[b]; n; ) { GNode *nx = n->next; free(n); n = nx; }
+    free(buckets);
+
+    /* Whole-table aggregate with no GROUP BY and no rows: still one group. */
+    if (s->ngroup == 0 && ng == 0) {
+        groups = realloc(groups, sizeof(Group));
+        groups[0].rows = NULL; groups[0].nrows = 0; groups[0].cap = 0; ng = 1;
+    }
+
+    Rel out = {0};
+    out_schema(s, in, &out.cols, &out.ncols);
+    for (size_t gi = 0; gi < ng; gi++) {
+        Row **grows = groups[gi].rows; size_t gn = groups[gi].nrows;
+        if (s->having && !is_true(eval_group(s->having, in, grows, gn))) continue;
+        Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+        size_t vi = 0;
+        for (size_t k = 0; k < s->nitems; k++) {
+            SelItem *it = &s->items[k];
+            if (it->kind == SEL_STAR) {
+                for (size_t j = 0; j < in->ncols; j++) {
+                    Value nv; nv.type = TYPE_NULL;
+                    row.values[vi++] = gn ? value_dup(&grows[0]->values[j]) : nv;
+                }
+            } else if (it->kind == SEL_COLUMN) {
+                int idx = rel_find_col(in, &it->col);
+                Value nv; nv.type = TYPE_NULL;
+                row.values[vi++] = (idx >= 0 && gn) ? value_dup(&grows[0]->values[idx]) : nv;
+            } else {
+                Value a = eval_agg(it->agg, it->agg_star, &it->col, in, grows, gn);
+                row.values[vi++] = value_dup(&a);
+            }
+        }
+        rel_add_row(&out, row);
+    }
+    for (size_t gi = 0; gi < ng; gi++) free(groups[gi].rows);
+    free(groups); free(gidx);
+    return out;
+}
+
+/* --- ORDER BY via qsort. qsort has no context arg, so we pass it through
+ * file-scope pointers (single-threaded, so this is safe here). */
+static const Rel *g_ord_rel; static const OrderItem *g_ord; static size_t g_ord_n;
+static int row_cmp(const void *pa, const void *pb) {
+    const Row *ra = pa, *rb = pb;
+    for (size_t k = 0; k < g_ord_n; k++) {
+        int idx = rel_find_col(g_ord_rel, &g_ord[k].col);
+        if (idx < 0) continue;
+        Value *a = &ra->values[idx], *b = &rb->values[idx];
+        int c;
+        if (a->type == TYPE_NULL && b->type == TYPE_NULL) c = 0;
+        else if (a->type == TYPE_NULL) c = -1;
+        else if (b->type == TYPE_NULL) c = 1;
+        else if (!value_compare(a, b, &c)) c = 0;
+        if (c != 0) return g_ord[k].desc ? -c : c;
+    }
+    return 0;
+}
+static void order_rel(Rel *r, const SelectStmt *s) {
+    g_ord_rel = r; g_ord = s->order; g_ord_n = s->norder;
+    qsort(r->rows, r->nrows, sizeof(Row), row_cmp);
+}
+
+/* --- the conductor: run a SelectStmt against a set of loaded tables. --- */
+typedef struct { char *name; Table table; } NamedTable;
+typedef struct { NamedTable *items; size_t count; } Database;
+
+static Table *db_get(Database *db, const char *name) {
+    for (size_t i = 0; i < db->count; i++)
+        if (strcmp(db->items[i].name, name) == 0) return &db->items[i].table;
+    return NULL;
+}
+
+/* --- planner helpers: predicate pushdown --------------------------------- */
+
+/* Flatten a WHERE tree into its top-level AND-conjuncts (borrowed pointers). */
+static void collect_conjuncts(const Expr *e, const Expr ***arr, size_t *n) {
+    if (!e) return;
+    if (e->kind == EXPR_BINARY && e->op == TOK_AND) {
+        collect_conjuncts(e->left, arr, n);
+        collect_conjuncts(e->right, arr, n);
+    } else {
+        *arr = realloc(*arr, (*n + 1) * sizeof(Expr *));
+        (*arr)[(*n)++] = e;
+    }
+}
+static void esq_walk(const Expr *e, const char **q, int *ncols, int *bad) {
+    if (!e) return;
+    if (e->kind == EXPR_COLUMN) {
+        (*ncols)++;
+        if (!e->col.table) { *bad = 1; return; }
+        if (!*q) *q = e->col.table;
+        else if (strcmp(*q, e->col.table) != 0) *bad = 1;
+    } else if (e->kind == EXPR_AGG) { *bad = 1; }
+    else if (e->kind == EXPR_BINARY) { esq_walk(e->left, q, ncols, bad); esq_walk(e->right, q, ncols, bad); }
+}
+/* If every column in e is qualified by ONE table, return that qualifier and set
+ * *ncols; otherwise return NULL. Used to decide if a predicate can be pushed. */
+static const char *expr_single_qualifier(const Expr *e, int *ncols) {
+    const char *q = NULL; int bad = 0; *ncols = 0;
+    esq_walk(e, &q, ncols, &bad);
+    return bad ? NULL : q;
+}
+
+/* Collect the distinct table qualifiers referenced by an expression. */
+static void expr_quals(const Expr *e, const char **set, int *n, int cap) {
+    if (!e) return;
+    if (e->kind == EXPR_COLUMN || e->kind == EXPR_AGG) {
+        if (e->col.table) {
+            for (int i = 0; i < *n; i++) if (strcmp(set[i], e->col.table) == 0) return;
+            if (*n < cap) set[(*n)++] = e->col.table;
+        }
+    } else if (e->kind == EXPR_BINARY) {
+        expr_quals(e->left, set, n, cap); expr_quals(e->right, set, n, cap);
+    }
+}
+
+/* Cost-based join ordering. Fills order[0..njoins-1] with the sequence in which
+ * to apply the joins. For all-INNER queries with 2+ joins we reorder greedily:
+ * repeatedly add the smallest table whose join predicate only references tables
+ * already joined (so its ON clause still resolves). Otherwise we keep the
+ * written order (LEFT joins aren't freely reorderable). */
+static void plan_join_order(Database *db, const SelectStmt *s, size_t *order) {
+    size_t m = s->njoins;
+    int all_inner = 1;
+    for (size_t i = 0; i < m; i++) if (s->joins[i].type != JOIN_INNER) all_inner = 0;
+    if (!all_inner || m < 2) { for (size_t i = 0; i < m; i++) order[i] = i; return; }
+
+    /* node 0 = base (FROM); node k+1 = the table of join k */
+    const char *nq[64]; nq[0] = s->from_alias ? s->from_alias : s->from_table;
+    for (size_t k = 0; k < m && k + 1 < 64; k++)
+        nq[k + 1] = s->joins[k].alias ? s->joins[k].alias : s->joins[k].table;
+
+    char inS[64] = {0}; inS[0] = 1;                 /* base is the seed */
+    size_t no = 0;
+    for (size_t step = 0; step < m; step++) {
+        long best = -1; double bestsz = 0;
+        for (size_t k = 0; k < m; k++) {
+            if (inS[k + 1]) continue;
+            const char *qs[16]; int nqn = 0;
+            expr_quals(s->joins[k].on, qs, &nqn, 16);
+            int ok = 1;                             /* all other endpoints already joined? */
+            for (int qi = 0; qi < nqn; qi++) {
+                int node = -1;
+                for (size_t d = 0; d <= m; d++) if (nq[d] && strcmp(nq[d], qs[qi]) == 0) { node = (int)d; break; }
+                if (node >= 0 && node != (int)(k + 1) && !inS[node]) { ok = 0; break; }
+            }
+            if (!ok) continue;
+            Table *t = db_get(db, s->joins[k].table);
+            double sz = t ? (double)t->row_count : 1e18;
+            if (best < 0 || sz < bestsz) { best = (long)k; bestsz = sz; }
+        }
+        if (best < 0) for (size_t k = 0; k < m; k++) if (!inS[k + 1]) { best = (long)k; break; }
+        order[no++] = (size_t)best; inS[best + 1] = 1;
+    }
+}
+
+/* If conjunct e is `col OP literal` (or `literal OP col`) on the base table,
+ * return the base column index and set *op (normalized so the column is on the
+ * left) and *key (borrowed literal). Otherwise return -1. */
+static int indexable_pred(const Expr *e, Table *base, const char *bq,
+                          TokenType *op, const Value **key) {
+    if (!e || e->kind != EXPR_BINARY) return -1;
+    TokenType o = e->op;
+    if (!(o == TOK_EQ || o == TOK_LT || o == TOK_GT || o == TOK_LE || o == TOK_GE)) return -1;
+    const Expr *colE, *litE; int swapped = 0;
+    if (e->left->kind == EXPR_COLUMN && e->right->kind == EXPR_LITERAL) { colE = e->left; litE = e->right; }
+    else if (e->left->kind == EXPR_LITERAL && e->right->kind == EXPR_COLUMN) { colE = e->right; litE = e->left; swapped = 1; }
+    else return -1;
+    if (colE->col.table && strcmp(colE->col.table, bq) != 0) return -1;
+    int ci = -1;
+    for (size_t i = 0; i < base->col_count; i++)
+        if (strcmp(base->col_names[i], colE->col.column) == 0) { ci = (int)i; break; }
+    if (ci < 0) return -1;
+    if (swapped) switch (o) { case TOK_LT: o = TOK_GT; break; case TOK_GT: o = TOK_LT; break;
+                              case TOK_LE: o = TOK_GE; break; case TOK_GE: o = TOK_LE; break; default: break; }
+    *op = o; *key = &litE->literal; return ci;
+}
+
+static int execute_select(Database *db, const SelectStmt *s, Rel *result) {
+    Table *base = db_get(db, s->from_table);
+    if (!base) { fprintf(stderr, "no such table: %s\n", s->from_table); return 0; }
+
+    /* Planner: split WHERE into conjuncts so single-table ones can be pushed
+       down to filter a relation BEFORE joining (smaller intermediate results). */
+    const Expr **conj = NULL; size_t nconj = 0;
+    if (s->where) collect_conjuncts(s->where, &conj, &nconj);
+    char *pushed = calloc(nconj ? nconj : 1, 1);
+
+    const char *bq = s->from_alias ? s->from_alias : s->from_table;
+
+    /* Index scan: if a base predicate is `col OP literal` and a suitable index
+       exists (or auto-index is on), fetch just the matching rows instead of
+       copying and scanning the whole table. */
+    Rel cur; int built = 0; g_used_index = 0;
+    for (size_t c = 0; c < nconj && !built; c++) {
+        TokenType op; const Value *key;
+        int ci = indexable_pred(conj[c], base, bq, &op, &key);
+        if (ci < 0) continue;
+        int want_range = (op != TOK_EQ);
+        Index *ix = table_find_index(base, ci, want_range);
+        /* auto-build only the cheap hash index (equality). Ranges need a sorted
+           index (an O(n log n) build) — not worth it unless the user asks via
+           .index <t> <c> sorted, so we don't auto-build those. */
+        if (!ix && g_auto_index && !want_range) {
+            table_add_index(base, ci, IDX_HASH);
+            ix = table_find_index(base, ci, 0);
+        }
+        if (!ix) continue;
+        size_t *rows; size_t nr = index_lookup(base, ix, op, key, &rows);
+        cur = rel_from_table_rows(base, bq, rows, nr);
+        free(rows);
+        pushed[c] = 1; built = 1; g_used_index = 1;
+    }
+    if (!built) cur = rel_from_table(base, bq);
+
+    for (size_t c = 0; c < nconj; c++) {           /* push remaining base predicates as filters */
+        if (pushed[c]) continue;
+        int n; const char *q = expr_single_qualifier(conj[c], &n);
+        if (n > 0 && q && strcmp(q, bq) == 0) {
+            Rel f = filter_rel(&cur, conj[c]); rel_free(&cur); cur = f; pushed[c] = 1;
+        }
+    }
+
+    size_t *order = malloc((s->njoins ? s->njoins : 1) * sizeof(size_t));
+    plan_join_order(db, s, order);
+    for (size_t oi = 0; oi < s->njoins; oi++) {
+        size_t i = order[oi];
+        Table *rt = db_get(db, s->joins[i].table);
+        if (!rt) { fprintf(stderr, "no such table: %s\n", s->joins[i].table);
+                   rel_free(&cur); free(pushed); free(conj); free(order); return 0; }
+        const char *rq = s->joins[i].alias ? s->joins[i].alias : s->joins[i].table;
+
+        /* Is there a single-table filter targeting this right table? If so we
+           can't index-join it (the index is over ALL its rows). */
+        int right_has_filter = 0;
+        for (size_t c = 0; c < nconj; c++) if (!pushed[c]) {
+            int n; const char *q = expr_single_qualifier(conj[c], &n);
+            if (n > 0 && q && strcmp(q, rq) == 0) { right_has_filter = 1; break; }
+        }
+
+        /* INDEX JOIN: if the right table is unfiltered and has (or auto-gets) a
+           hash index on the join key, probe it per left row instead of copying
+           the whole right table. */
+        int did_index_join = 0;
+        if (!right_has_filter && g_join_mode != 1) {   /* respect forced nested-loop */
+            Rel rsch = rel_schema_only(rt, rq);
+            int lk, rk;
+            if (equijoin_keys(s->joins[i].on, &cur, &rsch, &lk, &rk)) {
+                Index *ix = table_find_index(rt, rk, 0);
+                if (!ix && g_auto_index) { table_add_index(rt, rk, IDX_HASH); ix = table_find_index(rt, rk, 0); }
+                if (ix) {
+                    Rel joined = join_index(&cur, rt, rq, lk, rk, ix, s->joins[i].type);
+                    rel_free(&cur); cur = joined; did_index_join = 1;
+                }
+            }
+            rel_free(&rsch);
+        }
+        if (did_index_join) continue;
+
+        Rel right = rel_from_table(rt, rq);
+        /* A single-table predicate on an INNER-joined table can be pushed too.
+           (Not for LEFT joins — that would wrongly drop NULL-extended rows.) */
+        if (s->joins[i].type == JOIN_INNER)
+            for (size_t c = 0; c < nconj; c++) if (!pushed[c]) {
+                int n; const char *q = expr_single_qualifier(conj[c], &n);
+                if (n > 0 && q && strcmp(q, rq) == 0) {
+                    Rel f = filter_rel(&right, conj[c]); rel_free(&right); right = f; pushed[c] = 1;
+                }
+            }
+        const char *algo;
+        Rel joined = join_dispatch(&cur, &right, s->joins[i].on, s->joins[i].type, &algo);
+        rel_free(&cur); rel_free(&right); cur = joined;
+    }
+
+    free(order);
+    /* Residual WHERE: any conjunct not pushed down (spans tables, unqualified). */
+    for (size_t c = 0; c < nconj; c++) if (!pushed[c]) {
+        Rel f = filter_rel(&cur, conj[c]); rel_free(&cur); cur = f;
+    }
+    free(pushed); free(conj);
+
+    int has_agg = 0;
+    for (size_t i = 0; i < s->nitems; i++) if (s->items[i].kind == SEL_AGG) has_agg = 1;
+
+    Rel out = (has_agg || s->ngroup > 0) ? aggregate(s, &cur) : project_plain(s, &cur);
+    rel_free(&cur);
+
+    if (s->norder) order_rel(&out, s);
+    if (s->limit >= 0 && (size_t)s->limit < out.nrows) {
+        for (size_t i = s->limit; i < out.nrows; i++) {
+            for (size_t j = 0; j < out.rows[i].count; j++)
+                if (out.rows[i].values[j].type == TYPE_STRING) free(out.rows[i].values[j].as.str_val);
+            free(out.rows[i].values);
+        }
+        out.nrows = s->limit;
+    }
+    *result = out;
+    return 1;
+}
+
+/* Print a result relation as an aligned grid. */
+static void rel_print(const Rel *r) {
+    char buf[512];
+    size_t *w = malloc(r->ncols * sizeof(size_t));
+    for (size_t c = 0; c < r->ncols; c++) {
+        w[c] = strlen(r->cols[c].name);
+        size_t tl = strlen(type_name(r->cols[c].type)); if (tl > w[c]) w[c] = tl;
+    }
+    for (size_t i = 0; i < r->nrows; i++)
+        for (size_t c = 0; c < r->ncols; c++) {
+            value_str(&r->rows[i].values[c], buf, sizeof buf);
+            size_t len = strlen(buf); if (len > w[c]) w[c] = len;
+        }
+    for (size_t c = 0; c < r->ncols; c++) printf("%-*s  ", (int)w[c], r->cols[c].name);
+    printf("\n");
+    for (size_t c = 0; c < r->ncols; c++) printf("%-*s  ", (int)w[c], type_name(r->cols[c].type));
+    printf("\n");
+    for (size_t c = 0; c < r->ncols; c++) { for (size_t i = 0; i < w[c]; i++) putchar('-'); printf("  "); }
+    printf("\n");
+    for (size_t i = 0; i < r->nrows; i++) {
+        for (size_t c = 0; c < r->ncols; c++) {
+            value_str(&r->rows[i].values[c], buf, sizeof buf);
+            printf("%-*s  ", (int)w[c], buf);
+        }
+        printf("\n");
+    }
+    free(w);
+    printf("(%zu row%s)\n", r->nrows, r->nrows == 1 ? "" : "s");
+}
+
+/* ===========================================================================
+ * STEP 9 — QUERY PLANNER (EXPLAIN): reason about a query WITHOUT executing it,
+ * using only table sizes and schemas. Shows join order, the chosen algorithm
+ * per join (hash vs nested-loop), pushed-down filters, and a rough cost.
+ * ========================================================================= */
+static Rel rel_schema_only(const Table *t, const char *qual) {
+    Rel r = {0}; r.ncols = t->col_count; r.cols = malloc(r.ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < r.ncols; i++) {
+        r.cols[i].qualifier = qual ? strdup(qual) : NULL;
+        r.cols[i].name = strdup(t->col_names[i]); r.cols[i].type = t->col_types[i];
+    }
+    return r;   /* no rows: planning only needs the schema */
+}
+static Rel rel_combine_schema(const Rel *L, const Rel *R) {
+    Rel out = {0}; out.ncols = L->ncols + R->ncols; out.cols = malloc(out.ncols * sizeof(ColMeta));
+    for (size_t i = 0; i < L->ncols; i++) {
+        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+    }
+    for (size_t i = 0; i < R->ncols; i++) { size_t o = L->ncols + i;
+        out.cols[o].qualifier = R->cols[i].qualifier ? strdup(R->cols[i].qualifier) : NULL;
+        out.cols[o].name = strdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
+    }
+    return out;
+}
+static void explain_select(Database *db, const SelectStmt *s) {
+    Table *base = db_get(db, s->from_table);
+    if (!base) { fprintf(stderr, "no such table: %s\n", s->from_table); return; }
+    const Expr **conj = NULL; size_t nconj = 0;
+    if (s->where) collect_conjuncts(s->where, &conj, &nconj);
+    char *pushed = calloc(nconj ? nconj : 1, 1);
+
+    const char *bq = s->from_alias ? s->from_alias : s->from_table;
+    Rel cur = rel_schema_only(base, bq);
+    double est = (double)base->row_count;
+    printf("QUERY PLAN\n");
+    printf("  Scan %s (rows=%zu)\n", bq, base->row_count);
+    for (size_t c = 0; c < nconj; c++) { int n; const char *q = expr_single_qualifier(conj[c], &n);
+        if (n > 0 && q && strcmp(q, bq) == 0) { printf("    +push filter onto %s\n", bq); pushed[c] = 1; est *= 0.5; } }
+
+    size_t *order = malloc((s->njoins ? s->njoins : 1) * sizeof(size_t));
+    plan_join_order(db, s, order);
+    for (size_t oi = 0; oi < s->njoins; oi++) {
+        size_t i = order[oi];
+        Table *rt = db_get(db, s->joins[i].table);
+        if (!rt) { printf("  (no such table: %s)\n", s->joins[i].table); break; }
+        const char *rq = s->joins[i].alias ? s->joins[i].alias : s->joins[i].table;
+        Rel right = rel_schema_only(rt, rq);
+        double rsize = (double)rt->row_count;
+        if (s->joins[i].type == JOIN_INNER)
+            for (size_t c = 0; c < nconj; c++) if (!pushed[c]) { int n; const char *q = expr_single_qualifier(conj[c], &n);
+                if (n > 0 && q && strcmp(q, rq) == 0) { printf("    +push filter onto %s\n", rq); pushed[c] = 1; rsize *= 0.5; } }
+        int lk, rk, equi = equijoin_keys(s->joins[i].on, &cur, &right, &lk, &rk);
+        const char *algo = (g_join_mode == 1) ? "nested-loop" : (equi ? "hash" : "nested-loop");
+        double cost = strcmp(algo, "hash") == 0 ? est + rsize : est * rsize;
+        printf("  %s JOIN %s [%s]  (left~%.0f x right~%.0f, cost~%.0f)\n",
+               s->joins[i].type == JOIN_LEFT ? "LEFT" : "INNER", rq, algo, est, rsize, cost);
+        Rel comb = rel_combine_schema(&cur, &right);
+        rel_free(&cur); rel_free(&right); cur = comb;
+        est = equi ? (est > rsize ? est : rsize) : est * rsize * 0.1;
+    }
+    for (size_t c = 0; c < nconj; c++) if (!pushed[c]) { printf("  Filter (residual WHERE)\n"); break; }
+    int has_agg = 0; for (size_t i = 0; i < s->nitems; i++) if (s->items[i].kind == SEL_AGG) has_agg = 1;
+    if (has_agg || s->ngroup) printf("  Aggregate (%zu group key%s)\n", s->ngroup, s->ngroup == 1 ? "" : "s");
+    if (s->norder) printf("  Sort (%zu key%s)\n", s->norder, s->norder == 1 ? "" : "s");
+    if (s->limit >= 0) printf("  Limit %ld\n", s->limit);
+    printf("  est. rows out ~ %.0f\n", est);
+    rel_free(&cur); free(pushed); free(conj); free(order);
+}
+
+/* ===========================================================================
+ * STEP 8 — REPL: the user-facing shell. Loads CSVs as tables, runs SQL,
+ * pretty-prints results. Meta-commands start with '.'.
+ * ========================================================================= */
+
+/* Add a table under `name`, replacing any existing table of that name. */
+static void db_add(Database *db, const char *name, Table t) {
+    for (size_t i = 0; i < db->count; i++)
+        if (strcmp(db->items[i].name, name) == 0) {
+            table_free(&db->items[i].table);
+            db->items[i].table = t;
+            return;
+        }
+    db->items = realloc(db->items, (db->count + 1) * sizeof(NamedTable));
+    db->items[db->count].name = strdup(name);
+    db->items[db->count].table = t;
+    db->count++;
+}
+
+static void meta_command(Database *db, char *line) {
+    char *cmd = strtok(line, " \t");
+    if (!cmd) return;
+
+    if (strcmp(cmd, ".quit") == 0 || strcmp(cmd, ".exit") == 0) {
+        exit(0);
+    } else if (strcmp(cmd, ".help") == 0) {
+        printf(".load <file.csv> <name>   load a CSV as a table\n"
+               ".tables                   list loaded tables\n"
+               ".schema <name>            show a table's columns and types\n"
+               ".dump <name>              print an entire table\n"
+               ".ast <sql>                show the parse tree for a query\n"
+               ".plan <sql>               show the query plan (EXPLAIN)\n"
+               ".join auto|nested|hash    choose join algorithm (default auto)\n"
+               ".index <tbl> <col> [hash|sorted]  build a secondary index\n"
+               ".autoindex on|off         auto-build indexes on filter columns\n"
+               ".timer on|off             print per-query execution time\n"
+               ".quit                     exit\n"
+               "Anything else is run as a SQL SELECT query.\n");
+    } else if (strcmp(cmd, ".load") == 0) {
+        char *file = strtok(NULL, " \t");
+        char *name = strtok(NULL, " \t");
+        if (!file || !name) { fprintf(stderr, "usage: .load <file.csv> <name>\n"); return; }
+        Table t = load_table(name, file);
+        if (t.col_count == 0) { fprintf(stderr, "could not load %s\n", file); table_free(&t); return; }
+        db_add(db, name, t);
+        printf("loaded %zu row%s into \"%s\"\n", t.row_count, t.row_count == 1 ? "" : "s", name);
+    } else if (strcmp(cmd, ".tables") == 0) {
+        if (db->count == 0) printf("(no tables loaded)\n");
+        for (size_t i = 0; i < db->count; i++)
+            printf("  %s (%zu rows)\n", db->items[i].name, db->items[i].table.row_count);
+    } else if (strcmp(cmd, ".schema") == 0) {
+        char *name = strtok(NULL, " \t");
+        Table *t = name ? db_get(db, name) : NULL;
+        if (!t) { fprintf(stderr, "no such table: %s\n", name ? name : "(none)"); return; }
+        printf("%s (\n", name);
+        for (size_t c = 0; c < t->col_count; c++)
+            printf("  %-16s %s\n", t->col_names[c], type_name(t->col_types[c]));
+        printf(")\n");
+    } else if (strcmp(cmd, ".dump") == 0) {
+        char *name = strtok(NULL, " \t");
+        Table *t = name ? db_get(db, name) : NULL;
+        if (!t) { fprintf(stderr, "no such table: %s\n", name ? name : "(none)"); return; }
+        print_table(t);
+    } else if (strcmp(cmd, ".ast") == 0) {
+        char *sql = strtok(NULL, "");   /* rest of the line */
+        if (!sql) { fprintf(stderr, "usage: .ast <sql>\n"); return; }
+        size_t n = strlen(sql); while (n && (sql[n-1]==';'||sql[n-1]==' ')) sql[--n]='\0';
+        SelectStmt *s = parse_sql(sql);
+        if (s) { print_ast(s); free_select(s); } else printf("(parse error)\n");
+    } else if (strcmp(cmd, ".plan") == 0) {
+        char *sql = strtok(NULL, "");
+        if (!sql) { fprintf(stderr, "usage: .plan <sql>\n"); return; }
+        size_t n = strlen(sql); while (n && (sql[n-1]==';'||sql[n-1]==' ')) sql[--n]='\0';
+        SelectStmt *s = parse_sql(sql);
+        if (s) { explain_select(db, s); free_select(s); } else printf("(parse error)\n");
+    } else if (strcmp(cmd, ".join") == 0) {
+        char *mode = strtok(NULL, " \t");
+        if (!mode) { printf("join mode: %s\n", g_join_mode == 1 ? "nested" : "auto"); return; }
+        if (strcmp(mode, "auto") == 0) g_join_mode = 0;
+        else if (strcmp(mode, "nested") == 0) g_join_mode = 1;
+        else if (strcmp(mode, "hash") == 0) g_join_mode = 0;   /* hash-when-possible == auto */
+        else { fprintf(stderr, "usage: .join auto|nested|hash\n"); return; }
+        printf("join mode set to %s\n", mode);
+    } else if (strcmp(cmd, ".index") == 0) {
+        char *tn = strtok(NULL, " \t"), *cn = strtok(NULL, " \t"), *kn = strtok(NULL, " \t");
+        Table *t = tn ? db_get(db, tn) : NULL;
+        if (!t || !cn) { fprintf(stderr, "usage: .index <table> <col> [hash|sorted]\n"); return; }
+        int ci = -1;
+        for (size_t i = 0; i < t->col_count; i++) if (strcmp(t->col_names[i], cn) == 0) ci = (int)i;
+        if (ci < 0) { fprintf(stderr, "no such column: %s\n", cn); return; }
+        IndexKind kind = (kn && strcmp(kn, "sorted") == 0) ? IDX_SORTED : IDX_HASH;
+        table_add_index(t, ci, kind);
+        printf("built %s index on %s.%s\n", kind == IDX_SORTED ? "sorted" : "hash", tn, cn);
+    } else if (strcmp(cmd, ".autoindex") == 0) {
+        char *m = strtok(NULL, " \t");
+        if (m && strcmp(m, "on") == 0) g_auto_index = 1;
+        else if (m && strcmp(m, "off") == 0) g_auto_index = 0;
+        else { printf("autoindex is %s\n", g_auto_index ? "on" : "off"); return; }
+        printf("autoindex %s\n", g_auto_index ? "on" : "off");
+    } else if (strcmp(cmd, ".timer") == 0) {
+        char *m = strtok(NULL, " \t");
+        g_timer = (m && strcmp(m, "on") == 0);
+        printf("timer %s\n", g_timer ? "on" : "off");
+    } else {
+        fprintf(stderr, "unknown command: %s (try .help)\n", cmd);
+    }
+}
+
+static void run_sql(Database *db, const char *sql) {
+    SelectStmt *s = parse_sql(sql);
+    if (!s) return;                      /* tokenizer/parser already reported */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    Rel r;
+    int ok = execute_select(db, s, &r);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (ok) { rel_print(&r); rel_free(&r); }
+    if (g_timer) {
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        fprintf(stderr, "time: %.3f ms%s\n", ms, g_used_index ? " (index scan)" : "");
+    }
+    free_select(s);
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);   /* line-buffer so output/errors interleave in order */
+    Database db = {0};
+    int interactive = isatty(0);
+
+    char *line = NULL; size_t cap = 0; ssize_t len;
+    if (interactive) { printf("minisql — .help for commands, .quit to exit\n"); printf("minisql> "); fflush(stdout); }
+
+    while ((len = getline(&line, &cap, stdin)) != -1) {
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+
+        /* trim leading whitespace */
+        char *p = line; while (*p == ' ' || *p == '\t') p++;
+
+        if (*p == '\0') { /* blank line */ }
+        else if (*p == '.') meta_command(&db, p);
+        else {
+            /* strip a trailing ';' if present, then run as SQL */
+            size_t n = strlen(p);
+            while (n > 0 && (p[n-1] == ';' || p[n-1] == ' ' || p[n-1] == '\t')) p[--n] = '\0';
+            if (n > 0) run_sql(&db, p);
+        }
+        if (interactive) { printf("minisql> "); fflush(stdout); }
+    }
+    if (interactive) printf("\n");
+
+    free(line);
+    for (size_t i = 0; i < db.count; i++) { free(db.items[i].name); table_free(&db.items[i].table); }
+    free(db.items);
+    return 0;
+}
