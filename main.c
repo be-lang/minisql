@@ -1,5 +1,6 @@
 /* ===========================================================================
  * minisql — a tiny SQL engine in C, no dependencies.
+ * Copyright (c) 2026 Benjamin Lang. All rights reserved.
  *
  * Loads CSV files as in-memory tables and runs SELECT queries over them:
  * WHERE, INNER/LEFT JOIN, GROUP BY + aggregates, HAVING, ORDER BY, LIMIT.
