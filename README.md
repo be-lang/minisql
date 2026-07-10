@@ -4,9 +4,6 @@ A tiny SQL engine in C — one file, no dependencies. It loads CSV files as tabl
 and runs `SELECT` queries over them, using the same `parse → plan → execute`
 pipeline a real database uses, small enough to read start to finish.
 
-Built to understand how databases actually work. It's a learning project, not a
-replacement for sqlite/DuckDB.
-
 ## Build & run
 
 ```sh
@@ -48,9 +45,3 @@ Everything lives in `main.c` (~2,500 lines), in top-to-bottom order.
 make test      # built-in checks
 make stress    # real queries, cross-checked against sqlite3 (needs sqlite3)
 ```
-
-## Similar projects
-
-- [cstack/db_tutorial](https://cstack.github.io/db_tutorial/) — build a SQLite clone in C, step by step
-- [csvdb](https://github.com/TicklishHoneyBee/csvdb) — SQL over CSV files in C
-- [dynajoe/tinydb](https://github.com/dynajoe/tinydb) — a relational engine written as a learning exercise
