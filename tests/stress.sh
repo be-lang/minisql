@@ -46,5 +46,23 @@ ck    "SELECT COUNT(*) FROM customers WHERE LENGTH(UPPER(city)) = 6;" "SELECT CO
 ck    "SELECT COUNT(*) FROM orders WHERE amount + customer_id > 20000;" "SELECT COUNT(*) FROM orders WHERE amount + customer_id > 20000;" "column arithmetic"
 ck    "SELECT COUNT(DISTINCT customer_id) FROM orders WHERE amount > 995;" "SELECT COUNT(DISTINCT customer_id) FROM orders WHERE amount > 995;" "COUNT(DISTINCT) + WHERE"
 
+# --- binder: unknown columns must ERROR, not silently return NULL ----------
+run(){ printf ".load bench/customers.csv customers\n.load bench/orders.csv orders\n%s\n" "$1" | $BIN 2>&1; }
+musterr(){ if run "$1" | grep -qi "bind error"; then pass=$((pass+1)); printf "OK    %-46s (rejected)\n" "$2";
+           else fail=$((fail+1)); printf "FAIL  %-46s should have errored\n" "$2"; fi; }
+mustok(){  if run "$1" | grep -qi "bind error"; then fail=$((fail+1)); printf "FAIL  %-46s wrongly rejected\n" "$2";
+           else pass=$((pass+1)); printf "OK    %-46s (accepted)\n" "$2"; fi; }
+
+musterr "SELECT * FROM customers WHERE cityy = 'Bern';"                        "typo in WHERE column"
+musterr "SELECT bogus FROM customers;"                                        "typo in SELECT column"
+musterr "SELECT c.name FROM customers c JOIN orders o ON c.id = o.custid;"     "typo in JOIN key (the reported bug)"
+musterr "SELECT COUNT(*) FROM customers c JOIN orders o ON c.id=o.customer_id WHERE o.amt > 5;" "typo in qualified column"
+musterr "SELECT UPPER(citty) FROM customers;"                                 "typo inside a function"
+# valid queries that must still be accepted (guard against over-rejection)
+mustok  "SELECT city, COUNT(*) AS n FROM customers GROUP BY city ORDER BY n DESC;" "alias in ORDER BY"
+mustok  "SELECT city, COUNT(*) FROM customers GROUP BY city ORDER BY 2 DESC, 1;"  "positional ORDER BY"
+mustok  "SELECT city, COUNT(DISTINCT id) FROM customers GROUP BY city HAVING COUNT(*) > 100;" "aggregate in HAVING"
+mustok  "SELECT c.city, o.amount FROM customers c JOIN orders o ON c.id=o.customer_id LIMIT 1;" "qualified columns in join"
+
 echo "---"
-if [ "$fail" -eq 0 ]; then echo "STRESS OK: $pass/$((pass+fail)) real queries match sqlite"; else echo "STRESS FAILED: $fail of $((pass+fail)) differ"; exit 1; fi
+if [ "$fail" -eq 0 ]; then echo "STRESS OK: $pass/$((pass+fail)) real queries match sqlite / bind correctly"; else echo "STRESS FAILED: $fail of $((pass+fail)) differ"; exit 1; fi

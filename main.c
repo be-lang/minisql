@@ -1225,7 +1225,8 @@ static Value eval_agg_expr(const Expr *e, EvalCtx *cx) {
     struct DNode { unsigned long h; Value v; struct DNode *next; } **buckets = NULL; size_t nb = 0;
     if (e->distinct) { nb = 16; while (nb < n + 1) nb <<= 1; buckets = calloc(nb, sizeof(void *)); }
 
-    double acc = 0, mn = 0, mx = 0; long cnt = 0; int have = 0, isflt = 0;
+    double acc = 0; long cnt = 0; int isflt = 0;
+    Value best; best.type = TYPE_NULL;   /* MIN/MAX keep the winning Value itself, so strings work */
     EvalCtx sub = *cx; sub.grouped = 0; sub.grows = NULL; sub.gn = 0;
     for (size_t i = 0; i < n; i++) {
         sub.row = rows[i];
@@ -1238,19 +1239,22 @@ static Value eval_agg_expr(const Expr *e, EvalCtx *cx) {
             struct DNode *d = malloc(sizeof *d); d->h = h; d->v = val; d->next = buckets[b]; buckets[b] = d;
         }
         cnt++;
-        if (val.type == TYPE_FLOAT) isflt = 1;
-        double d = val.type == TYPE_FLOAT ? val.as.float_val : (double)val.as.int_val;
-        if (!have) { mn = mx = d; have = 1; } else { if (d < mn) mn = d; if (d > mx) mx = d; }
-        acc += d;
+        if (val.type == TYPE_FLOAT) { isflt = 1; acc += val.as.float_val; }
+        else if (val.type == TYPE_INT) acc += (double)val.as.int_val;
+        if (e->agg == TOK_MIN || e->agg == TOK_MAX) {
+            int c;
+            if (best.type == TYPE_NULL) best = val;
+            else if (value_compare(&val, &best, &c) && (e->agg == TOK_MIN ? c < 0 : c > 0)) best = val;
+        }
     }
     if (e->distinct) { for (size_t b = 0; b < nb; b++) { struct DNode *d = buckets[b]; while (d) { struct DNode *x = d->next; free(d); d = x; } } free(buckets); }
 
     switch (e->agg) {
         case TOK_COUNT: out.type = TYPE_INT; out.as.int_val = cnt; break;
-        case TOK_SUM: if (isflt) { out.type = TYPE_FLOAT; out.as.float_val = acc; } else { out.type = TYPE_INT; out.as.int_val = (long)acc; } break;
-        case TOK_AVG: out.type = TYPE_FLOAT; out.as.float_val = cnt ? acc / cnt : 0; break;
-        case TOK_MIN: case TOK_MAX: if (have) { double m = e->agg == TOK_MIN ? mn : mx;
-            if (isflt) { out.type = TYPE_FLOAT; out.as.float_val = m; } else { out.type = TYPE_INT; out.as.int_val = (long)m; } } break;
+        /* SUM/AVG of zero (non-NULL) inputs is NULL, not 0 — SQL semantics */
+        case TOK_SUM: if (cnt) { if (isflt) { out.type = TYPE_FLOAT; out.as.float_val = acc; } else { out.type = TYPE_INT; out.as.int_val = (long)acc; } } break;
+        case TOK_AVG: if (cnt) { out.type = TYPE_FLOAT; out.as.float_val = acc / cnt; } break;
+        case TOK_MIN: case TOK_MAX: out = best; break;
         default: break;
     }
     return out;
@@ -1409,7 +1413,9 @@ static Rel join_rel(const Rel *L, const Rel *R, const Expr *on, JoinType type) {
         for (size_t k = 0; k < L->ncols; k++) tmp.values[k] = L->rows[li].values[k];
         for (size_t ri = 0; ri < R->nrows; ri++) {
             for (size_t k = 0; k < R->ncols; k++) tmp.values[L->ncols + k] = R->rows[ri].values[k];
-            if (is_true(eval_expr(on, &out, &tmp))) {
+            int hit = is_true(eval_expr(on, &out, &tmp));
+            arena_reset();   /* ON may call string functions; don't hoard per-pair */
+            if (hit) {
                 Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
                 for (size_t k = 0; k < out.ncols; k++) row.values[k] = value_dup(&tmp.values[k]);
                 rel_add_row(&out, row); matched = 1;
@@ -2094,7 +2100,80 @@ static int indexable_pred(const Expr *e, Table *base, const char *bq,
     *op = o; *key = &litE->literal; return ci;
 }
 
+/* ===========================================================================
+ * BINDER (name resolution): before executing, resolve every column reference
+ * against the query's schema and ERROR on anything unknown — otherwise a typo'd
+ * column silently evaluates to NULL and the query "works" but returns nothing.
+ * We build a permissive scope (all FROM+JOIN columns, plus SELECT aliases so
+ * ORDER BY/HAVING can use them) to catch genuine typos without rejecting valid
+ * queries.
+ * ========================================================================= */
+typedef struct { const char *qual; const char *name; } BCol;
+typedef struct { BCol *cols; size_t n, cap; const char **aliases; size_t na, nacap; } BindScope;
+
+static void bs_addcol(BindScope *sc, const char *q, const char *nm) {
+    if (sc->n == sc->cap) { sc->cap = sc->cap ? sc->cap * 2 : 16; sc->cols = realloc(sc->cols, sc->cap * sizeof(BCol)); }
+    sc->cols[sc->n].qual = q; sc->cols[sc->n].name = nm; sc->n++;
+}
+static void bs_addalias(BindScope *sc, const char *a) {
+    if (sc->na == sc->nacap) { sc->nacap = sc->nacap ? sc->nacap * 2 : 8; sc->aliases = realloc(sc->aliases, sc->nacap * sizeof(char *)); }
+    sc->aliases[sc->na++] = a;
+}
+static int bs_addtable(BindScope *sc, Database *db, const char *tbl, const char *alias) {
+    Table *t = db_get(db, tbl);
+    if (!t) { fprintf(stderr, "bind error: no such table: %s\n", tbl); return 0; }
+    const char *q = alias ? alias : tbl;
+    for (size_t i = 0; i < t->col_count; i++) bs_addcol(sc, q, t->col_names[i]);
+    return 1;
+}
+/* returns 1 if the column resolves; prints a specific error and returns 0 if not */
+static int scope_resolve(const BindScope *sc, const ColRef *c) {
+    if (c->table) {                                   /* qualified: t.col */
+        int col = 0, tab = 0;
+        for (size_t i = 0; i < sc->n; i++)
+            if (strcmp(sc->cols[i].qual, c->table) == 0) { tab = 1; if (strcmp(sc->cols[i].name, c->column) == 0) col++; }
+        if (col >= 1) return 1;
+        if (tab) fprintf(stderr, "bind error: no such column: %s.%s\n", c->table, c->column);
+        else     fprintf(stderr, "bind error: no such table/alias: %s\n", c->table);
+        return 0;
+    }
+    int m = 0;                                        /* unqualified */
+    for (size_t i = 0; i < sc->n; i++) if (strcmp(sc->cols[i].name, c->column) == 0) m++;
+    if (m == 1) return 1;
+    if (m == 0) { for (size_t i = 0; i < sc->na; i++) if (strcmp(sc->aliases[i], c->column) == 0) return 1; }
+    if (m > 1) fprintf(stderr, "bind error: ambiguous column: %s\n", c->column);
+    else       fprintf(stderr, "bind error: no such column: %s\n", c->column);
+    return 0;
+}
+static int bind_expr(const BindScope *sc, const Expr *e) {
+    if (!e) return 1;
+    if (e->kind == EXPR_COLUMN) return scope_resolve(sc, &e->col);
+    if (!bind_expr(sc, e->left) || !bind_expr(sc, e->right) ||
+        !bind_expr(sc, e->lo)   || !bind_expr(sc, e->hi)) return 0;
+    for (size_t i = 0; i < e->nargs; i++) if (!bind_expr(sc, e->args[i])) return 0;
+    return 1;
+}
+static int bind_select(Database *db, const SelectStmt *s) {
+    BindScope sc = {0}; int ok = 1;
+    if (!bs_addtable(&sc, db, s->from_table, s->from_alias)) { ok = 0; goto done; }
+    for (size_t i = 0; i < s->njoins && ok; i++)
+        if (!bs_addtable(&sc, db, s->joins[i].table, s->joins[i].alias)) ok = 0;
+    if (!ok) goto done;
+    for (size_t i = 0; i < s->nitems; i++) if (s->items[i].alias) bs_addalias(&sc, s->items[i].alias);
+
+    for (size_t i = 0; i < s->njoins && ok; i++) ok = bind_expr(&sc, s->joins[i].on);
+    if (ok && s->where) ok = bind_expr(&sc, s->where);
+    for (size_t i = 0; i < s->ngroup && ok; i++) ok = scope_resolve(&sc, &s->group[i]);
+    for (size_t i = 0; i < s->nitems && ok; i++) if (s->items[i].kind == SEL_EXPR) ok = bind_expr(&sc, s->items[i].expr);
+    if (ok && s->having) ok = bind_expr(&sc, s->having);
+    for (size_t i = 0; i < s->norder && ok; i++) if (s->order[i].pos < 0) ok = bind_expr(&sc, s->order[i].expr);
+done:
+    free(sc.cols); free(sc.aliases);
+    return ok;
+}
+
 static int execute_select(Database *db, const SelectStmt *s, Rel *result) {
+    if (!bind_select(db, s)) return 0;               /* resolve names or fail loudly */
     Table *base = db_get(db, s->from_table);
     if (!base) { fprintf(stderr, "no such table: %s\n", s->from_table); return 0; }
 
@@ -2273,6 +2352,7 @@ static Rel rel_combine_schema(const Rel *L, const Rel *R) {
     return out;
 }
 static void explain_select(Database *db, const SelectStmt *s) {
+    if (!bind_select(db, s)) return;                 /* validate names first */
     Table *base = db_get(db, s->from_table);
     if (!base) { fprintf(stderr, "no such table: %s\n", s->from_table); return; }
     const Expr **conj = NULL; size_t nconj = 0;
