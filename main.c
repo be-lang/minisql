@@ -1586,7 +1586,14 @@ static unsigned long value_hash(const Value *v) {
         unsigned long u = 0;
         if (d != d) u = 0x7ff8000000000000UL;       /* all NaNs hash alike (they compare equal) */
         else if (d != 0) memcpy(&u, &d, sizeof d);  /* ±0.0 both keep u = 0 */
-        return u * 1099511628211UL;
+        /* Avalanche mix (murmur3 finalizer). Small ints as doubles keep their
+           value in the HIGH mantissa bits, leaving 35+ trailing zeros; an
+           odd-prime multiply preserves trailing zeros, so bucket = h & (nb-1)
+           would put every small int in bucket 0 -> O(n*m) hash joins. */
+        u ^= u >> 33; u *= 0xff51afd7ed558ccdUL;
+        u ^= u >> 33; u *= 0xc4ceb9fe1a85ec53UL;
+        u ^= u >> 33;
+        return u;
     }
     return 0;
 }

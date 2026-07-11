@@ -159,5 +159,14 @@ printf 'id,name\n1,Alice\n2,Bob,EXTRA\n' > "$tmp/ragged.csv"
 gr=$(printf '.load %s r\n' "$tmp/ragged.csv" | "$BIN" 2>&1)
 check "$gr" "expected 2" csv-extra-fields
 
+# --- hash join on sequential int keys must stay O(n+m) ----------------------
+# (canonicalizing ints through double bit patterns left 35+ trailing zeros;
+#  without an avalanche mix every key lands in bucket 0 -> O(n*m) join)
+python3 -c "
+f=open('$tmp/j1.csv','w'); f.write('id\n');   [f.write('%d\n'%i) for i in range(50000)]; f.close()
+f=open('$tmp/j2.csv','w'); f.write('ref\n');  [f.write('%d\n'%i) for i in range(50000)]; f.close()"
+gph=$(timeout 5 bash -c "printf '.load $tmp/j1.csv a\n.load $tmp/j2.csv b\nSELECT COUNT(*) FROM a JOIN b ON a.id = b.ref;\n' | '$BIN' 2>&1" | cell1)
+if [ "$gph" = "50000" ]; then pass=$((pass+1)); else echo "WRONG [hash-join-seq-keys]: got '$gph' want 50000 (within 5s)"; fail=$((fail+1)); fi
+
 echo "---"
 if [ "$fail" -eq 0 ]; then echo "REGRESSIONS OK: $pass checks passed"; else echo "REGRESSIONS FAILED: $fail failed, $pass passed"; exit 1; fi
