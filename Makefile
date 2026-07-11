@@ -11,6 +11,7 @@ run: $(TARGET)
 
 test: $(TARGET)
 	./tests/run.sh
+	./tests/regressions.sh
 
 # real-world SQL checked against sqlite3 (needs sqlite3 + bench data)
 stress: $(TARGET)
@@ -18,4 +19,4 @@ stress: $(TARGET)
 	./tests/stress.sh
 
 clean:
-	rm -f $(TARGET) t
+	rm -f $(TARGET) minisql_asan t

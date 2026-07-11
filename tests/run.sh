@@ -14,7 +14,7 @@ got=$(./minisql <<'SQL'
 .load data/albums.csv albums
 .tables
 SELECT a.name, COUNT(*) AS n FROM artists a JOIN albums b ON a.id = b.artist_id WHERE b.genre = 'Jazz' GROUP BY a.name ORDER BY n DESC, a.name;
-SELECT b.title, a.name FROM albums b LEFT JOIN artists a ON b.artist_id = a.id ORDER BY b.album_id;
+SELECT b.album_id, b.title, a.name FROM albums b LEFT JOIN artists a ON b.artist_id = a.id ORDER BY b.album_id;
 SELECT genre, COUNT(*) FROM albums GROUP BY genre HAVING COUNT(*) >= 2;
 SELECT COUNT(*), MIN(album_id), MAX(album_id) FROM albums;
 .quit

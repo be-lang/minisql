@@ -20,9 +20,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <time.h>
+
+/* ---------------------------------------------------------------------------
+ * Checked allocators: a query engine mid-operation has no sensible way to
+ * recover from OOM, so fail fast with a message rather than crash on NULL.
+ * ------------------------------------------------------------------------- */
+static void *xmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p && n) { fprintf(stderr, "fatal: out of memory (%zu bytes)\n", n); exit(1); }
+    return p;
+}
+static void *xcalloc(size_t n, size_t sz) {
+    void *p = calloc(n, sz);
+    if (!p && n && sz) { fprintf(stderr, "fatal: out of memory\n"); exit(1); }
+    return p;
+}
+static void *xrealloc(void *q, size_t n) {
+    void *p = realloc(q, n);
+    if (!p && n) { fprintf(stderr, "fatal: out of memory (%zu bytes)\n", n); exit(1); }
+    return p;
+}
+static char *xstrdup(const char *s) {
+    char *p = strdup(s);
+    if (!p) { fprintf(stderr, "fatal: out of memory\n"); exit(1); }
+    return p;
+}
 
 /* ---------------------------------------------------------------------------
  * StringList: a growable array of strings.
@@ -47,7 +73,7 @@ static void sl_push(StringList *sl, char *s) {
     if (sl->count == sl->capacity) {
         /* out of room: double the capacity (start at 8) */
         sl->capacity = sl->capacity ? sl->capacity * 2 : 8;
-        sl->items = realloc(sl->items, sl->capacity * sizeof(char *));
+        sl->items = xrealloc(sl->items, sl->capacity * sizeof(char *));
     }
     sl->items[sl->count++] = s;
 }
@@ -152,7 +178,7 @@ static StringList read_lines(const char *filename) {
         while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
             buf[--len] = '\0';
         /* strdup makes our OWN copy — getline reuses `buf` next loop */
-        sl_push(&lines, strdup(buf));
+        sl_push(&lines, xstrdup(buf));
     }
 
     free(buf);
@@ -179,7 +205,7 @@ static StringList split_line(const char *line) {
 
     /* A single field can never be longer than the whole line, so one buffer of
        that size is always big enough; we reuse it for every field. */
-    char *buf = malloc(strlen(line) + 1);
+    char *buf = xmalloc(strlen(line) + 1);
     size_t i = 0;   /* read cursor into `line` */
 
     for (;;) {
@@ -206,7 +232,7 @@ static StringList split_line(const char *line) {
         }
 
         buf[b] = '\0';
-        sl_push(&fields, strdup(buf));
+        sl_push(&fields, xstrdup(buf));
 
         if (line[i] == ',') { i++; continue; }      /* another field follows */
         break;                                       /* end of line */
@@ -225,10 +251,10 @@ static Table parse_header(const char *name, const char *header) {
     StringList cols = split_line(header);
 
     Table t;
-    t.name         = strdup(name);
+    t.name         = xstrdup(name);
     t.col_count    = cols.count;
-    t.col_names    = malloc(t.col_count * sizeof(char *));
-    t.col_types    = malloc(t.col_count * sizeof(ColumnType));
+    t.col_names    = xmalloc(t.col_count * sizeof(char *));
+    t.col_types    = xmalloc(t.col_count * sizeof(ColumnType));
     t.rows         = NULL;
     t.row_count    = 0;
     t.row_capacity = 0;
@@ -236,7 +262,7 @@ static Table parse_header(const char *name, const char *header) {
     t.nindex       = 0;
 
     for (size_t i = 0; i < t.col_count; i++) {
-        t.col_names[i] = strdup(cols.items[i]);
+        t.col_names[i] = xstrdup(cols.items[i]);
         t.col_types[i] = TYPE_NULL;   /* unknown until we infer it */
     }
 
@@ -306,7 +332,7 @@ static Value make_value_from_string(const char *raw, ColumnType type) {
             break;
         default:                            /* STRING (or a NULL-typed column) */
             v.type = TYPE_STRING;
-            v.as.str_val = strdup(raw);
+            v.as.str_val = xstrdup(raw);
             break;
     }
     return v;
@@ -328,7 +354,7 @@ static const char *type_name(ColumnType t) {
 static void table_add_row(Table *t, Row row) {
     if (t->row_count == t->row_capacity) {
         t->row_capacity = t->row_capacity ? t->row_capacity * 2 : 8;
-        t->rows = realloc(t->rows, t->row_capacity * sizeof(Row));
+        t->rows = xrealloc(t->rows, t->row_capacity * sizeof(Row));
     }
     t->rows[t->row_count++] = row;
 }
@@ -343,7 +369,7 @@ static Table load_table(const char *name, const char *filename) {
     Table t;
     if (lines.count == 0) {                 /* empty / missing file */
         memset(&t, 0, sizeof t);
-        t.name = strdup(name);
+        t.name = xstrdup(name);
         sl_free(&lines);
         return t;
     }
@@ -353,14 +379,22 @@ static Table load_table(const char *name, const char *filename) {
     /* Split every data row ONCE and keep the field lists — we use them twice:
        first to infer column types, then to build the typed Values. */
     size_t nrows = lines.count - 1;
-    StringList *rowfields = malloc(nrows * sizeof(StringList));
-    for (size_t r = 0; r < nrows; r++)
+    StringList *rowfields = xmalloc(nrows * sizeof(StringList));
+    size_t ragged = 0;
+    for (size_t r = 0; r < nrows; r++) {
         rowfields[r] = split_line(lines.items[r + 1]);
+        /* extra fields would be silently dropped below — never lose data silently */
+        if (rowfields[r].count > t.col_count && ragged++ < 5)
+            fprintf(stderr, "warning: %s row %zu has %zu fields, expected %zu (extra dropped)\n",
+                    filename, r + 2, rowfields[r].count, t.col_count);
+    }
+    if (ragged > 5)
+        fprintf(stderr, "warning: %s: %zu more rows with extra fields\n", filename, ragged - 5);
 
     /* Infer each column's type from its values across all rows. We BORROW the
        already-split field pointers (no strdup) — inference only reads them —
        and free just the pointer array, not the strings. */
-    char **colvals = malloc(nrows * sizeof(char *));
+    char **colvals = xmalloc(nrows * sizeof(char *));
     for (size_t c = 0; c < t.col_count; c++) {
         StringList col = { colvals, 0, nrows };
         for (size_t r = 0; r < nrows; r++)
@@ -374,7 +408,7 @@ static Table load_table(const char *name, const char *filename) {
     for (size_t r = 0; r < nrows; r++) {
         Row row;
         row.count  = t.col_count;
-        row.values = malloc(t.col_count * sizeof(Value));
+        row.values = xmalloc(t.col_count * sizeof(Value));
         for (size_t c = 0; c < t.col_count; c++) {
             const char *raw = (c < rowfields[r].count) ? rowfields[r].items[c] : "";
             row.values[c] = make_value_from_string(raw, t.col_types[c]);
@@ -406,7 +440,7 @@ static void print_table(const Table *t) {
 
     /* First pass: each column is as wide as the widest of its name, its type
        label, and any value in it. */
-    size_t *w = malloc(t->col_count * sizeof(size_t));
+    size_t *w = xmalloc(t->col_count * sizeof(size_t));
     for (size_t c = 0; c < t->col_count; c++) {
         w[c] = strlen(t->col_names[c]);
         size_t tl = strlen(type_name(t->col_types[c]));
@@ -499,7 +533,7 @@ static int ci_equal(const char *a, const char *b) {
 static void tl_push(TokenList *tl, TokenType type, char *text, int pos) {
     if (tl->count == tl->capacity) {
         tl->capacity = tl->capacity ? tl->capacity * 2 : 16;
-        tl->items = realloc(tl->items, tl->capacity * sizeof(Token));
+        tl->items = xrealloc(tl->items, tl->capacity * sizeof(Token));
     }
     tl->items[tl->count].type = type;
     tl->items[tl->count].text = text;
@@ -517,7 +551,7 @@ static void tl_free(TokenList *tl) {
 /* Copy the substring sql[start..end) into a fresh NUL-terminated string. */
 static char *substr(const char *sql, int start, int end) {
     int n = end - start;
-    char *s = malloc(n + 1);
+    char *s = xmalloc(n + 1);
     memcpy(s, sql + start, n);
     s[n] = '\0';
     return s;
@@ -562,14 +596,19 @@ static TokenList tokenize(const char *sql) {
             int start = i;
             i++;                              /* skip opening quote */
             /* build the unescaped contents into a buffer */
-            char *out = malloc(strlen(sql) + 1);
-            int b = 0;
+            char *out = xmalloc(strlen(sql) + 1);
+            int b = 0, closed = 0;
             while (sql[i] != '\0') {
                 if (sql[i] == '\'' && sql[i+1] == '\'') { out[b++] = '\''; i += 2; }
-                else if (sql[i] == '\'') { i++; break; }
+                else if (sql[i] == '\'') { i++; closed = 1; break; }
                 else out[b++] = sql[i++];
             }
             out[b] = '\0';
+            if (!closed) {                    /* ran off the end without a closing quote */
+                free(out);
+                fprintf(stderr, "tokenize: unterminated string literal at %d\n", start);
+                tl_push(&tl, TOK_ERROR, NULL, start); goto done;
+            }
             tl_push(&tl, TOK_STRING, out, start);
             continue;
         }
@@ -699,7 +738,8 @@ typedef struct {
 } SelectStmt;
 
 /* --- parser state --- */
-typedef struct { TokenList *tl; size_t pos; int error; } Parser;
+typedef struct { TokenList *tl; size_t pos; int error; int depth; } Parser;
+#define PARSE_MAX_DEPTH 500   /* guards against stack overflow on deeply nested input */
 
 static Token *peek(Parser *p)            { return &p->tl->items[p->pos]; }
 static int    check(Parser *p, TokenType t){ return peek(p)->type == t; }
@@ -722,11 +762,11 @@ static ColRef parse_colref(Parser *p) {
     if (!check(p, TOK_IDENT)) { perr(p, "expected a column name"); return c; }
     char *first = advance(p)->text;
     if (match(p, TOK_DOT)) {
-        c.table = strdup(first);
+        c.table = xstrdup(first);
         if (!check(p, TOK_IDENT)) { perr(p, "expected column after '.'"); return c; }
-        c.column = strdup(advance(p)->text);
+        c.column = xstrdup(advance(p)->text);
     } else {
-        c.column = strdup(first);
+        c.column = xstrdup(first);
     }
     return c;
 }
@@ -738,10 +778,12 @@ static Expr *parse_expr(Parser *p);
 /* primary = literal | NULL | agg'('[DISTINCT] expr | '*'')' | func'('args')'
  *         | column | '(' expr ')' */
 static Expr *parse_primary(Parser *p) {
-    Expr *e = calloc(1, sizeof(Expr));
+    Expr *e = xcalloc(1, sizeof(Expr));
     if (match(p, TOK_LPAREN)) {
         free(e);
+        if (++p->depth > PARSE_MAX_DEPTH) { perr(p, "expression nested too deeply"); return NULL; }
         Expr *inner = parse_expr(p);
+        p->depth--;
         expect(p, TOK_RPAREN, "expected ')'");
         return inner;
     }
@@ -755,7 +797,7 @@ static Expr *parse_primary(Parser *p) {
     }
     if (check(p, TOK_STRING)) {
         e->kind = EXPR_LITERAL; e->literal.type = TYPE_STRING;
-        e->literal.as.str_val = strdup(advance(p)->text); return e;
+        e->literal.as.str_val = xstrdup(advance(p)->text); return e;
     }
     if (match(p, TOK_NULL_KW)) { e->kind = EXPR_LITERAL; e->literal.type = TYPE_NULL; return e; }
     TokenType t = peek(p)->type;
@@ -769,10 +811,10 @@ static Expr *parse_primary(Parser *p) {
     }
     /* scalar function call: IDENT '(' args ')' */
     if (check(p, TOK_IDENT) && p->tl->items[p->pos + 1].type == TOK_LPAREN) {
-        e->kind = EXPR_FUNC; e->fname = strdup(advance(p)->text);
+        e->kind = EXPR_FUNC; e->fname = xstrdup(advance(p)->text);
         advance(p);  /* '(' */
         if (!check(p, TOK_RPAREN)) do {
-            e->args = realloc(e->args, (e->nargs + 1) * sizeof(Expr *));
+            e->args = xrealloc(e->args, (e->nargs + 1) * sizeof(Expr *));
             e->args[e->nargs++] = parse_expr(p);
         } while (match(p, TOK_COMMA));
         expect(p, TOK_RPAREN, "expected ')'");
@@ -782,12 +824,15 @@ static Expr *parse_primary(Parser *p) {
     perr(p, "expected a value or column"); free(e); return NULL;
 }
 
-static Expr *mk(ExprKind k) { Expr *e = calloc(1, sizeof(Expr)); e->kind = k; return e; }
+static Expr *mk(ExprKind k) { Expr *e = xcalloc(1, sizeof(Expr)); e->kind = k; return e; }
 static Expr *make_not(Expr *inner) { Expr *e = mk(EXPR_UNARY); e->op = TOK_NOT; e->left = inner; return e; }
 
 /* unary = '-' unary | primary */
 static Expr *parse_unary(Parser *p) {
-    if (match(p, TOK_MINUS)) { Expr *e = mk(EXPR_UNARY); e->op = TOK_MINUS; e->left = parse_unary(p); return e; }
+    if (match(p, TOK_MINUS)) {
+        if (++p->depth > PARSE_MAX_DEPTH) { perr(p, "expression nested too deeply"); return NULL; }
+        Expr *e = mk(EXPR_UNARY); e->op = TOK_MINUS; e->left = parse_unary(p); p->depth--; return e;
+    }
     return parse_primary(p);
 }
 /* mul = unary (('*' | '/') unary)* */
@@ -821,7 +866,7 @@ static Expr *parse_comparison(Parser *p) {
         advance(p); expect(p, TOK_LPAREN, "expected '(' after IN");
         Expr *e = mk(EXPR_IN); e->left = left;
         if (!check(p, TOK_RPAREN)) do {
-            e->args = realloc(e->args, (e->nargs + 1) * sizeof(Expr *)); e->args[e->nargs++] = parse_expr(p);
+            e->args = xrealloc(e->args, (e->nargs + 1) * sizeof(Expr *)); e->args[e->nargs++] = parse_expr(p);
         } while (match(p, TOK_COMMA));
         expect(p, TOK_RPAREN, "expected ')'");
         return neg ? make_not(e) : e;
@@ -845,7 +890,10 @@ static Expr *parse_comparison(Parser *p) {
 }
 /* not = NOT not | comparison */
 static Expr *parse_not(Parser *p) {
-    if (match(p, TOK_NOT)) return make_not(parse_not(p));
+    if (match(p, TOK_NOT)) {
+        if (++p->depth > PARSE_MAX_DEPTH) { perr(p, "expression nested too deeply"); return NULL; }
+        Expr *e = make_not(parse_not(p)); p->depth--; return e;
+    }
     return parse_comparison(p);
 }
 /* and = not (AND not)* */
@@ -854,10 +902,14 @@ static Expr *parse_and(Parser *p) {
     while (match(p, TOK_AND)) { Expr *e = mk(EXPR_BINARY); e->op = TOK_AND; e->left = left; e->right = parse_not(p); left = e; }
     return left;
 }
-/* expr = and (OR and)* */
+/* expr = and (OR and)* — the single entry point for every subexpression
+ * (parens, function args, aggregate operands, IN-list elements, ...), so the
+ * recursion-depth guard here covers ALL nesting paths, not just parens. */
 static Expr *parse_expr(Parser *p) {
+    if (++p->depth > PARSE_MAX_DEPTH) { perr(p, "expression nested too deeply"); p->depth--; return NULL; }
     Expr *left = parse_and(p);
     while (match(p, TOK_OR)) { Expr *e = mk(EXPR_BINARY); e->op = TOK_OR; e->left = left; e->right = parse_and(p); left = e; }
+    p->depth--;
     return left;
 }
 
@@ -867,7 +919,7 @@ static SelItem parse_sel_item(Parser *p) {
     if (check(p, TOK_STAR)) { advance(p); it.kind = SEL_STAR; return it; }
     it.kind = SEL_EXPR; it.expr = parse_expr(p);
     if (match(p, TOK_AS)) {
-        if (check(p, TOK_IDENT)) it.alias = strdup(advance(p)->text);
+        if (check(p, TOK_IDENT)) it.alias = xstrdup(advance(p)->text);
         else perr(p, "expected alias after AS");
     }
     return it;
@@ -876,18 +928,18 @@ static SelItem parse_sel_item(Parser *p) {
 /* table_ref = ident [AS ident | ident] ; fills *table and *alias */
 static void parse_table_ref(Parser *p, char **table, char **alias) {
     if (!check(p, TOK_IDENT)) { perr(p, "expected a table name"); return; }
-    *table = strdup(advance(p)->text);
+    *table = xstrdup(advance(p)->text);
     *alias = NULL;
     if (match(p, TOK_AS)) {
-        if (check(p, TOK_IDENT)) *alias = strdup(advance(p)->text);
+        if (check(p, TOK_IDENT)) *alias = xstrdup(advance(p)->text);
         else perr(p, "expected alias after AS");
     } else if (check(p, TOK_IDENT)) {
-        *alias = strdup(advance(p)->text);
+        *alias = xstrdup(advance(p)->text);
     }
 }
 
 static SelectStmt *parse_select(Parser *p) {
-    SelectStmt *s = calloc(1, sizeof(SelectStmt));
+    SelectStmt *s = xcalloc(1, sizeof(SelectStmt));
     s->limit = -1;
 
     expect(p, TOK_SELECT, "expected SELECT");
@@ -895,7 +947,7 @@ static SelectStmt *parse_select(Parser *p) {
 
     /* select list */
     do {
-        s->items = realloc(s->items, (s->nitems + 1) * sizeof(SelItem));
+        s->items = xrealloc(s->items, (s->nitems + 1) * sizeof(SelItem));
         s->items[s->nitems++] = parse_sel_item(p);
     } while (match(p, TOK_COMMA));
 
@@ -912,7 +964,7 @@ static SelectStmt *parse_select(Parser *p) {
         parse_table_ref(p, &j.table, &j.alias);
         expect(p, TOK_ON, "expected ON");
         j.on = parse_expr(p);
-        s->joins = realloc(s->joins, (s->njoins + 1) * sizeof(JoinClause));
+        s->joins = xrealloc(s->joins, (s->njoins + 1) * sizeof(JoinClause));
         s->joins[s->njoins++] = j;
     }
 
@@ -921,7 +973,7 @@ static SelectStmt *parse_select(Parser *p) {
     if (match(p, TOK_GROUP)) {
         expect(p, TOK_BY, "expected BY after GROUP");
         do {
-            s->group = realloc(s->group, (s->ngroup + 1) * sizeof(ColRef));
+            s->group = xrealloc(s->group, (s->ngroup + 1) * sizeof(ColRef));
             s->group[s->ngroup++] = parse_colref(p);
         } while (match(p, TOK_COMMA));
         if (match(p, TOK_HAVING)) s->having = parse_expr(p);
@@ -934,7 +986,7 @@ static SelectStmt *parse_select(Parser *p) {
             if (check(p, TOK_INT)) o.pos = strtol(advance(p)->text, NULL, 10);  /* positional */
             else { o.expr = mk(EXPR_COLUMN); o.expr->col = parse_colref(p); }
             if (match(p, TOK_DESC)) o.desc = 1; else match(p, TOK_ASC);
-            s->order = realloc(s->order, (s->norder + 1) * sizeof(OrderItem));
+            s->order = xrealloc(s->order, (s->norder + 1) * sizeof(OrderItem));
             s->order[s->norder++] = o;
         } while (match(p, TOK_COMMA));
     }
@@ -979,7 +1031,7 @@ static void free_select(SelectStmt *s) {
 /* Parse a SQL string into a SelectStmt (NULL on error). */
 static SelectStmt *parse_sql(const char *sql) {
     TokenList tl = tokenize(sql);
-    Parser p = { &tl, 0, 0 };
+    Parser p = { &tl, 0, 0, 0 };
     SelectStmt *s = parse_select(&p);
     tl_free(&tl);
     if (p.error) { free_select(s); return NULL; }
@@ -1076,7 +1128,7 @@ typedef struct { ColMeta *cols; size_t ncols; Row *rows; size_t nrows, cap; } Re
 
 static Value value_dup(const Value *v) {
     Value o = *v;
-    if (v->type == TYPE_STRING) o.as.str_val = strdup(v->as.str_val);
+    if (v->type == TYPE_STRING) o.as.str_val = xstrdup(v->as.str_val);
     return o;
 }
 static int is_true(Value v) {
@@ -1098,7 +1150,7 @@ static int value_compare(const Value *a, const Value *b, int *out) {
 
 static void rel_add_row(Rel *r, Row row) {
     if (r->nrows == r->cap) { r->cap = r->cap ? r->cap * 2 : 16;
-                              r->rows = realloc(r->rows, r->cap * sizeof(Row)); }
+                              r->rows = xrealloc(r->rows, r->cap * sizeof(Row)); }
     r->rows[r->nrows++] = row;
 }
 static void rel_free(Rel *r) {
@@ -1114,10 +1166,10 @@ static void rel_free(Rel *r) {
 }
 static void copy_schema(Rel *dst, const Rel *src) {
     dst->ncols = src->ncols;
-    dst->cols = malloc(dst->ncols * sizeof(ColMeta));
+    dst->cols = xmalloc(dst->ncols * sizeof(ColMeta));
     for (size_t i = 0; i < dst->ncols; i++) {
-        dst->cols[i].qualifier = src->cols[i].qualifier ? strdup(src->cols[i].qualifier) : NULL;
-        dst->cols[i].name = strdup(src->cols[i].name);
+        dst->cols[i].qualifier = src->cols[i].qualifier ? xstrdup(src->cols[i].qualifier) : NULL;
+        dst->cols[i].name = xstrdup(src->cols[i].name);
         dst->cols[i].type = src->cols[i].type;
     }
 }
@@ -1144,7 +1196,7 @@ static unsigned long value_hash(const Value *v);
 static char **g_arena = NULL; static size_t g_arena_n = 0, g_arena_cap = 0;
 static char *arena_take(char *s) {
     if (g_arena_n == g_arena_cap) { g_arena_cap = g_arena_cap ? g_arena_cap * 2 : 16;
-        g_arena = realloc(g_arena, g_arena_cap * sizeof(char *)); }
+        g_arena = xrealloc(g_arena, g_arena_cap * sizeof(char *)); }
     g_arena[g_arena_n++] = s; return s;
 }
 static void arena_reset(void) { for (size_t i = 0; i < g_arena_n; i++) free(g_arena[i]); g_arena_n = 0; }
@@ -1154,22 +1206,21 @@ static void arena_reset(void) { for (size_t i = 0; i < g_arena_n; i++) free(g_ar
 typedef struct { const Rel *rel; const Row *row; Row **grows; size_t gn; int grouped; } EvalCtx;
 static Value eval(const Expr *e, EvalCtx *cx);
 
-/* Case-insensitive SQL LIKE: % = any run, _ = any single char (ASCII). */
+/* Case-insensitive SQL LIKE: % = any run, _ = any single char (ASCII).
+ * Iterative two-pointer matcher: on mismatch, retry from the most recent '%'
+ * with its span extended by one. O(len(s) * len(p)) worst case — a recursive
+ * matcher is exponential on patterns like '%a%a%a...%b'. */
 static int like_match(const char *s, const char *p) {
-    while (*p) {
-        if (*p == '%') {
-            p++; if (!*p) return 1;
-            for (; *s; s++) if (like_match(s, p)) return 1;
-            return like_match(s, p);
-        } else if (*p == '_') {
-            if (!*s) return 0;
-            s++; p++;
-        } else {
-            if (!*s || tolower((unsigned char)*s) != tolower((unsigned char)*p)) return 0;
-            s++; p++;
-        }
+    const char *star_p = NULL, *star_s = NULL;
+    while (*s) {
+        if (*p == '%') { star_p = ++p; star_s = s; }
+        else if (*p == '_' ||
+                 (*p && tolower((unsigned char)*s) == tolower((unsigned char)*p))) { s++; p++; }
+        else if (star_p) { p = star_p; s = ++star_s; }
+        else return 0;
     }
-    return *s == '\0';
+    while (*p == '%') p++;
+    return *p == '\0';
 }
 
 /* Scalar functions: UPPER LOWER LENGTH ABS ROUND COALESCE TRIM. */
@@ -1184,7 +1235,7 @@ static Value eval_func(const Expr *e, EvalCtx *cx) {
     Value a = eval(e->args[0], cx);
     if (ci_equal(fn, "upper") || ci_equal(fn, "lower")) {
         if (a.type != TYPE_STRING) return a;
-        char *o = strdup(a.as.str_val); int up = ci_equal(fn, "upper");
+        char *o = xstrdup(a.as.str_val); int up = ci_equal(fn, "upper");
         for (char *q = o; *q; q++) *q = up ? toupper((unsigned char)*q) : tolower((unsigned char)*q);
         v.type = TYPE_STRING; v.as.str_val = arena_take(o); return v;
     }
@@ -1194,7 +1245,10 @@ static Value eval_func(const Expr *e, EvalCtx *cx) {
         v.type = TYPE_INT; v.as.int_val = (long)strlen(a.type == TYPE_STRING ? a.as.str_val : b); return v;
     }
     if (ci_equal(fn, "abs")) {
-        if (a.type == TYPE_INT)   { v.type = TYPE_INT;   v.as.int_val = a.as.int_val < 0 ? -a.as.int_val : a.as.int_val; }
+        if (a.type == TYPE_INT) {
+            if (a.as.int_val == LONG_MIN) { v.type = TYPE_FLOAT; v.as.float_val = -(double)LONG_MIN; }
+            else { v.type = TYPE_INT; v.as.int_val = a.as.int_val < 0 ? -a.as.int_val : a.as.int_val; }
+        }
         if (a.type == TYPE_FLOAT) { v.type = TYPE_FLOAT; v.as.float_val = a.as.float_val < 0 ? -a.as.float_val : a.as.float_val; }
         return v;
     }
@@ -1202,15 +1256,21 @@ static Value eval_func(const Expr *e, EvalCtx *cx) {
         if (a.type == TYPE_NULL) return v;
         double d = a.type == TYPE_FLOAT ? a.as.float_val : (double)a.as.int_val;
         int nd = 0; if (e->nargs > 1) { Value b = eval(e->args[1], cx); if (b.type == TYPE_INT) nd = (int)b.as.int_val; }
-        double f = 1; for (int i = 0; i < nd; i++) f *= 10;
-        double av = d < 0 ? -d : d; long ip = (long)(av * f + 0.5); double rr = (double)ip / f;
-        v.type = TYPE_FLOAT; v.as.float_val = d < 0 ? -rr : rr; return v;
+        if (nd < 0) nd = 0;
+        if (nd > 30) nd = 30;                        /* clamp, like sqlite */
+        /* Match sqlite: 0 digits rounds half away from zero (when it fits in a
+           long); otherwise round via printf, which sees the TRUE binary value —
+           so ROUND(2.675, 2) is 2.67, because 2.675 is really 2.67499... */
+        if (nd == 0 && d >= 0 && d < 9223372036854774784.0)      d = (double)(long)(d + 0.5);
+        else if (nd == 0 && d < 0 && -d < 9223372036854774784.0) d = -(double)(long)(-d + 0.5);
+        else { char rb[400]; snprintf(rb, sizeof rb, "%.*f", nd, d); d = strtod(rb, NULL); }
+        v.type = TYPE_FLOAT; v.as.float_val = d; return v;
     }
     if (ci_equal(fn, "trim")) {
         if (a.type != TYPE_STRING) return a;
         const char *s = a.as.str_val; while (*s == ' ') s++;
         size_t len = strlen(s); while (len && s[len - 1] == ' ') len--;
-        char *o = malloc(len + 1); memcpy(o, s, len); o[len] = '\0';
+        char *o = xmalloc(len + 1); memcpy(o, s, len); o[len] = '\0';
         v.type = TYPE_STRING; v.as.str_val = arena_take(o); return v;
     }
     fprintf(stderr, "unknown function: %s\n", fn);
@@ -1224,9 +1284,12 @@ static Value eval_agg_expr(const Expr *e, EvalCtx *cx) {
     if (e->agg == TOK_COUNT && e->agg_star) { out.type = TYPE_INT; out.as.int_val = (long)n; return out; }
 
     struct DNode { unsigned long h; Value v; struct DNode *next; } **buckets = NULL; size_t nb = 0;
-    if (e->distinct) { nb = 16; while (nb < n + 1) nb <<= 1; buckets = calloc(nb, sizeof(void *)); }
+    if (e->distinct) { nb = 16; while (nb < n + 1) nb <<= 1; buckets = xcalloc(nb, sizeof(void *)); }
 
+    /* acc (double) feeds AVG and any float input; iacc keeps integer SUM exact.
+       If the integer sum overflows, SUM falls back to the double (as + and * do). */
     double acc = 0; long cnt = 0; int isflt = 0;
+    long iacc = 0; int iovf = 0;
     Value best; best.type = TYPE_NULL;   /* MIN/MAX keep the winning Value itself, so strings work */
     EvalCtx sub = *cx; sub.grouped = 0; sub.grows = NULL; sub.gn = 0;
     for (size_t i = 0; i < n; i++) {
@@ -1237,11 +1300,14 @@ static Value eval_agg_expr(const Expr *e, EvalCtx *cx) {
             unsigned long h = value_hash(&val); size_t b = h & (nb - 1); int seen = 0;
             for (struct DNode *d = buckets[b]; d; d = d->next) { int c; if (d->h == h && value_compare(&d->v, &val, &c) && c == 0) { seen = 1; break; } }
             if (seen) continue;
-            struct DNode *d = malloc(sizeof *d); d->h = h; d->v = val; d->next = buckets[b]; buckets[b] = d;
+            struct DNode *d = xmalloc(sizeof *d); d->h = h; d->v = val; d->next = buckets[b]; buckets[b] = d;
         }
         cnt++;
         if (val.type == TYPE_FLOAT) { isflt = 1; acc += val.as.float_val; }
-        else if (val.type == TYPE_INT) acc += (double)val.as.int_val;
+        else if (val.type == TYPE_INT) {
+            acc += (double)val.as.int_val;
+            if (!iovf && __builtin_add_overflow(iacc, val.as.int_val, &iacc)) iovf = 1;
+        }
         if (e->agg == TOK_MIN || e->agg == TOK_MAX) {
             int c;
             if (best.type == TYPE_NULL) best = val;
@@ -1253,7 +1319,7 @@ static Value eval_agg_expr(const Expr *e, EvalCtx *cx) {
     switch (e->agg) {
         case TOK_COUNT: out.type = TYPE_INT; out.as.int_val = cnt; break;
         /* SUM/AVG of zero (non-NULL) inputs is NULL, not 0 — SQL semantics */
-        case TOK_SUM: if (cnt) { if (isflt) { out.type = TYPE_FLOAT; out.as.float_val = acc; } else { out.type = TYPE_INT; out.as.int_val = (long)acc; } } break;
+        case TOK_SUM: if (cnt) { if (isflt || iovf) { out.type = TYPE_FLOAT; out.as.float_val = acc; } else { out.type = TYPE_INT; out.as.int_val = iacc; } } break;
         case TOK_AVG: if (cnt) { out.type = TYPE_FLOAT; out.as.float_val = acc / cnt; } break;
         case TOK_MIN: case TOK_MAX: out = best; break;
         default: break;
@@ -1282,7 +1348,10 @@ static Value eval(const Expr *e, EvalCtx *cx) {
                 if (a.type == TYPE_NULL) return v;
                 v.type = TYPE_INT; v.as.int_val = !is_true(a); return v;
             }
-            if (a.type == TYPE_INT)   { v.type = TYPE_INT;   v.as.int_val = -a.as.int_val; }
+            if (a.type == TYPE_INT) {
+                if (a.as.int_val == LONG_MIN) { v.type = TYPE_FLOAT; v.as.float_val = -(double)LONG_MIN; }
+                else { v.type = TYPE_INT; v.as.int_val = -a.as.int_val; }
+            }
             if (a.type == TYPE_FLOAT) { v.type = TYPE_FLOAT; v.as.float_val = -a.as.float_val; }
             return v;
         }
@@ -1294,10 +1363,13 @@ static Value eval(const Expr *e, EvalCtx *cx) {
         case EXPR_IN: {
             Value a = eval(e->left, cx);
             if (a.type == TYPE_NULL) return v;
+            int sawnull = 0;
             for (size_t i = 0; i < e->nargs; i++) {
                 Value b = eval(e->args[i], cx); int c;
+                if (b.type == TYPE_NULL) { sawnull = 1; continue; }
                 if (value_compare(&a, &b, &c) && c == 0) { v.type = TYPE_INT; v.as.int_val = 1; return v; }
             }
+            if (sawnull) return v;   /* no match but a NULL in the list -> UNKNOWN (SQL 3-valued logic) */
             v.type = TYPE_INT; v.as.int_val = 0; return v;
         }
         case EXPR_BETWEEN: {
@@ -1308,8 +1380,21 @@ static Value eval(const Expr *e, EvalCtx *cx) {
         }
         case EXPR_BINARY: {
             if (e->op == TOK_AND || e->op == TOK_OR) {
-                int l = is_true(eval(e->left, cx)), rr = is_true(eval(e->right, cx));
-                v.type = TYPE_INT; v.as.int_val = e->op == TOK_AND ? (l && rr) : (l || rr); return v;
+                /* SQL three-valued logic: NULL is UNKNOWN, not false. It only
+                   collapses when the other side decides the result outright
+                   (FALSE AND x, TRUE OR x); otherwise UNKNOWN propagates, so
+                   NOT (NULL OR FALSE) stays UNKNOWN instead of becoming TRUE. */
+                Value lv = eval(e->left, cx), rv = eval(e->right, cx);
+                int l  = lv.type == TYPE_NULL ? -1 : is_true(lv);   /* -1 = UNKNOWN */
+                int rr = rv.type == TYPE_NULL ? -1 : is_true(rv);
+                if (e->op == TOK_AND) {
+                    if (l == 0 || rr == 0) { v.type = TYPE_INT; v.as.int_val = 0; return v; }
+                    if (l < 0 || rr < 0) return v;                  /* UNKNOWN */
+                    v.type = TYPE_INT; v.as.int_val = 1; return v;
+                }
+                if (l == 1 || rr == 1) { v.type = TYPE_INT; v.as.int_val = 1; return v; }
+                if (l < 0 || rr < 0) return v;                      /* UNKNOWN */
+                v.type = TYPE_INT; v.as.int_val = 0; return v;
             }
             Value a = eval(e->left, cx), b = eval(e->right, cx);
             if (e->op == TOK_LIKE) {
@@ -1328,10 +1413,22 @@ static Value eval(const Expr *e, EvalCtx *cx) {
                     if (e->op == TOK_SLASH && y == 0) return v;
                     v.type = TYPE_FLOAT; v.as.float_val = r; return v;
                 }
-                long x = a.as.int_val, y = b.as.int_val;
-                if (e->op == TOK_SLASH && y == 0) return v;
-                long r = e->op == TOK_PLUS ? x + y : e->op == TOK_MINUS ? x - y :
-                         e->op == TOK_STAR ? x * y : x / y;   /* integer division, like sqlite */
+                long x = a.as.int_val, y = b.as.int_val, r;
+                if (e->op == TOK_SLASH) {
+                    if (y == 0) return v;
+                    if (x == LONG_MIN && y == -1) { v.type = TYPE_FLOAT; v.as.float_val = -(double)LONG_MIN; return v; }
+                    v.type = TYPE_INT; v.as.int_val = x / y; return v;   /* integer division, like sqlite */
+                }
+                /* checked add/sub/mul: on overflow, promote to double (as sqlite does) */
+                int ovf = e->op == TOK_PLUS  ? __builtin_add_overflow(x, y, &r) :
+                          e->op == TOK_MINUS ? __builtin_sub_overflow(x, y, &r) :
+                                               __builtin_mul_overflow(x, y, &r);
+                if (ovf) {
+                    double dx = (double)x, dy = (double)y;
+                    v.type = TYPE_FLOAT;
+                    v.as.float_val = e->op == TOK_PLUS ? dx + dy : e->op == TOK_MINUS ? dx - dy : dx * dy;
+                    return v;
+                }
                 v.type = TYPE_INT; v.as.int_val = r; return v;
             }
             int cmp; if (!value_compare(&a, &b, &cmp)) return v;
@@ -1360,14 +1457,14 @@ static Value eval_group(const Expr *e, const Rel *r, Row **rows, size_t nrows) {
 static Rel rel_from_table(const Table *t, const char *qual) {
     Rel r = {0};
     r.ncols = t->col_count;
-    r.cols = malloc(r.ncols * sizeof(ColMeta));
+    r.cols = xmalloc(r.ncols * sizeof(ColMeta));
     for (size_t i = 0; i < r.ncols; i++) {
-        r.cols[i].qualifier = qual ? strdup(qual) : NULL;
-        r.cols[i].name = strdup(t->col_names[i]);
+        r.cols[i].qualifier = qual ? xstrdup(qual) : NULL;
+        r.cols[i].name = xstrdup(t->col_names[i]);
         r.cols[i].type = t->col_types[i];
     }
     for (size_t i = 0; i < t->row_count; i++) {
-        Row row; row.count = t->col_count; row.values = malloc(row.count * sizeof(Value));
+        Row row; row.count = t->col_count; row.values = xmalloc(row.count * sizeof(Value));
         for (size_t j = 0; j < row.count; j++) row.values[j] = value_dup(&t->rows[i].values[j]);
         rel_add_row(&r, row);
     }
@@ -1379,15 +1476,15 @@ static Rel rel_from_table(const Table *t, const char *qual) {
 static Rel rel_from_table_rows(const Table *t, const char *qual, const size_t *rowidx, size_t n) {
     Rel r = {0};
     r.ncols = t->col_count;
-    r.cols = malloc(r.ncols * sizeof(ColMeta));
+    r.cols = xmalloc(r.ncols * sizeof(ColMeta));
     for (size_t i = 0; i < r.ncols; i++) {
-        r.cols[i].qualifier = qual ? strdup(qual) : NULL;
-        r.cols[i].name = strdup(t->col_names[i]);
+        r.cols[i].qualifier = qual ? xstrdup(qual) : NULL;
+        r.cols[i].name = xstrdup(t->col_names[i]);
         r.cols[i].type = t->col_types[i];
     }
     for (size_t k = 0; k < n; k++) {
         size_t i = rowidx[k];
-        Row row; row.count = t->col_count; row.values = malloc(row.count * sizeof(Value));
+        Row row; row.count = t->col_count; row.values = xmalloc(row.count * sizeof(Value));
         for (size_t j = 0; j < row.count; j++) row.values[j] = value_dup(&t->rows[i].values[j]);
         rel_add_row(&r, row);
     }
@@ -1398,17 +1495,17 @@ static Rel rel_from_table_rows(const Table *t, const char *qual, const size_t *r
 static Rel join_rel(const Rel *L, const Rel *R, const Expr *on, JoinType type) {
     Rel out = {0};
     out.ncols = L->ncols + R->ncols;
-    out.cols = malloc(out.ncols * sizeof(ColMeta));
+    out.cols = xmalloc(out.ncols * sizeof(ColMeta));
     for (size_t i = 0; i < L->ncols; i++) {
-        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
-        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+        out.cols[i].qualifier = L->cols[i].qualifier ? xstrdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = xstrdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
     }
     for (size_t i = 0; i < R->ncols; i++) {
         size_t o = L->ncols + i;
-        out.cols[o].qualifier = R->cols[i].qualifier ? strdup(R->cols[i].qualifier) : NULL;
-        out.cols[o].name = strdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
+        out.cols[o].qualifier = R->cols[i].qualifier ? xstrdup(R->cols[i].qualifier) : NULL;
+        out.cols[o].name = xstrdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
     }
-    Row tmp; tmp.count = out.ncols; tmp.values = malloc(out.ncols * sizeof(Value));
+    Row tmp; tmp.count = out.ncols; tmp.values = xmalloc(out.ncols * sizeof(Value));
     for (size_t li = 0; li < L->nrows; li++) {
         int matched = 0;
         for (size_t k = 0; k < L->ncols; k++) tmp.values[k] = L->rows[li].values[k];
@@ -1417,13 +1514,13 @@ static Rel join_rel(const Rel *L, const Rel *R, const Expr *on, JoinType type) {
             int hit = is_true(eval_expr(on, &out, &tmp));
             arena_reset();   /* ON may call string functions; don't hoard per-pair */
             if (hit) {
-                Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+                Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
                 for (size_t k = 0; k < out.ncols; k++) row.values[k] = value_dup(&tmp.values[k]);
                 rel_add_row(&out, row); matched = 1;
             }
         }
         if (type == JOIN_LEFT && !matched) {
-            Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+            Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
             for (size_t k = 0; k < L->ncols; k++) row.values[k] = value_dup(&L->rows[li].values[k]);
             for (size_t k = 0; k < R->ncols; k++) row.values[L->ncols + k].type = TYPE_NULL;
             rel_add_row(&out, row);
@@ -1443,9 +1540,16 @@ static unsigned long value_hash(const Value *v) {
         while (*s) h = ((h << 5) + h) + *s++;
         return h;
     }
-    if (v->type == TYPE_INT)   return (unsigned long)v->as.int_val * 1099511628211UL;
-    if (v->type == TYPE_FLOAT) { double d = v->as.float_val; unsigned long u = 0;
-                                 memcpy(&u, &d, sizeof d); return u * 1099511628211UL; }
+    /* Hash int and float through the SAME canonical form (double) so that
+       numerically-equal values — which value_compare() treats as equal, e.g.
+       int 5 and float 5.0 — always land in the same bucket. */
+    if (v->type == TYPE_INT || v->type == TYPE_FLOAT) {
+        double d = v->type == TYPE_FLOAT ? v->as.float_val : (double)v->as.int_val;
+        unsigned long u = 0;
+        if (d != d) u = 0x7ff8000000000000UL;       /* all NaNs hash alike (they compare equal) */
+        else if (d != 0) memcpy(&u, &d, sizeof d);  /* ±0.0 both keep u = 0 */
+        return u * 1099511628211UL;
+    }
     return 0;
 }
 
@@ -1497,7 +1601,7 @@ static void table_add_index(Table *t, int col, IndexKind kind) {
     for (size_t i = 0; i < t->nindex; i++)
         if (t->indexes[i].col == col && t->indexes[i].kind == kind) return;
 
-    t->indexes = realloc(t->indexes, (t->nindex + 1) * sizeof(Index));
+    t->indexes = xrealloc(t->indexes, (t->nindex + 1) * sizeof(Index));
     Index *ix = &t->indexes[t->nindex++];
     memset(ix, 0, sizeof *ix);
     ix->col = col; ix->kind = kind;
@@ -1505,8 +1609,8 @@ static void table_add_index(Table *t, int col, IndexKind kind) {
     if (kind == IDX_HASH) {
         size_t nb = 16; while (nb < t->row_count) nb <<= 1;
         ix->nbuckets = nb;
-        ix->buckets = calloc(nb, sizeof(IdxNode *));
-        ix->pool = t->row_count ? malloc(t->row_count * sizeof(IdxNode)) : NULL;
+        ix->buckets = xcalloc(nb, sizeof(IdxNode *));
+        ix->pool = t->row_count ? xmalloc(t->row_count * sizeof(IdxNode)) : NULL;
         for (size_t r = t->row_count; r-- > 0; ) {   /* descending -> ascending chains */
             Value *v = &t->rows[r].values[col];
             if (v->type == TYPE_NULL) continue;
@@ -1515,7 +1619,7 @@ static void table_add_index(Table *t, int col, IndexKind kind) {
             ix->pool[r].next = ix->buckets[b]; ix->buckets[b] = &ix->pool[r];
         }
     } else {   /* IDX_SORTED */
-        ix->sorted = malloc((t->row_count ? t->row_count : 1) * sizeof(size_t));
+        ix->sorted = xmalloc((t->row_count ? t->row_count : 1) * sizeof(size_t));
         ix->nsorted = 0;
         for (size_t r = 0; r < t->row_count; r++)
             if (t->rows[r].values[col].type != TYPE_NULL) ix->sorted[ix->nsorted++] = r;
@@ -1539,8 +1643,8 @@ static Index *table_find_index(Table *t, int col, int want_range) {
 /* Lookup rows where column `col` OP `key`. Fills *out (malloc'd) with matching
  * row indices, returns the count. op is a comparison TokenType. */
 static size_t index_lookup(Table *t, Index *ix, TokenType op, const Value *key, size_t **out) {
-    size_t cap = 16, n = 0; size_t *res = malloc(cap * sizeof(size_t));
-    #define PUSH(R) do { if (n==cap){cap*=2;res=realloc(res,cap*sizeof(size_t));} res[n++]=(R); } while(0)
+    size_t cap = 16, n = 0; size_t *res = xmalloc(cap * sizeof(size_t));
+    #define PUSH(R) do { if (n==cap){cap*=2;res=xrealloc(res,cap*sizeof(size_t));} res[n++]=(R); } while(0)
 
     if (ix->kind == IDX_HASH) {                 /* equality only */
         unsigned long h = value_hash(key); size_t b = h & (ix->nbuckets - 1);
@@ -1598,21 +1702,21 @@ typedef struct HNode { unsigned long h; size_t idx; struct HNode *next; } HNode;
 static Rel join_hash(const Rel *L, const Rel *R, int lk, int rk, JoinType type) {
     Rel out = {0};
     out.ncols = L->ncols + R->ncols;
-    out.cols = malloc(out.ncols * sizeof(ColMeta));
+    out.cols = xmalloc(out.ncols * sizeof(ColMeta));
     for (size_t i = 0; i < L->ncols; i++) {
-        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
-        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+        out.cols[i].qualifier = L->cols[i].qualifier ? xstrdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = xstrdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
     }
     for (size_t i = 0; i < R->ncols; i++) {
         size_t o = L->ncols + i;
-        out.cols[o].qualifier = R->cols[i].qualifier ? strdup(R->cols[i].qualifier) : NULL;
-        out.cols[o].name = strdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
+        out.cols[o].qualifier = R->cols[i].qualifier ? xstrdup(R->cols[i].qualifier) : NULL;
+        out.cols[o].name = xstrdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
     }
 
     /* Build phase: hash every right row by its key (NULL keys never match). */
     size_t nb = 16; while (nb < R->nrows) nb <<= 1;
-    HNode **buckets = calloc(nb, sizeof(HNode *));
-    HNode *pool = R->nrows ? malloc(R->nrows * sizeof(HNode)) : NULL;
+    HNode **buckets = xcalloc(nb, sizeof(HNode *));
+    HNode *pool = R->nrows ? xmalloc(R->nrows * sizeof(HNode)) : NULL;
     /* insert descending so each bucket chain ends up ascending by row index,
        matching nested-loop's output order for identical results */
     for (size_t ri = R->nrows; ri-- > 0; ) {
@@ -1624,7 +1728,7 @@ static Rel join_hash(const Rel *L, const Rel *R, int lk, int rk, JoinType type) 
     }
 
     /* Probe phase: for each left row, look up matches in O(1) average. */
-    Row tmp; tmp.count = out.ncols; tmp.values = malloc(out.ncols * sizeof(Value));
+    Row tmp; tmp.count = out.ncols; tmp.values = xmalloc(out.ncols * sizeof(Value));
     for (size_t li = 0; li < L->nrows; li++) {
         for (size_t k = 0; k < L->ncols; k++) tmp.values[k] = L->rows[li].values[k];
         int matched = 0;
@@ -1636,13 +1740,13 @@ static Rel join_hash(const Rel *L, const Rel *R, int lk, int rk, JoinType type) 
                 int cmp; Value *rkey = &R->rows[n->idx].values[rk];
                 if (!value_compare(key, rkey, &cmp) || cmp != 0) continue;
                 for (size_t k = 0; k < R->ncols; k++) tmp.values[L->ncols + k] = R->rows[n->idx].values[k];
-                Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+                Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
                 for (size_t k = 0; k < out.ncols; k++) row.values[k] = value_dup(&tmp.values[k]);
                 rel_add_row(&out, row); matched = 1;
             }
         }
         if (type == JOIN_LEFT && !matched) {
-            Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+            Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
             for (size_t k = 0; k < L->ncols; k++) row.values[k] = value_dup(&L->rows[li].values[k]);
             for (size_t k = 0; k < R->ncols; k++) row.values[L->ncols + k].type = TYPE_NULL;
             rel_add_row(&out, row);
@@ -1678,17 +1782,17 @@ static Rel join_index(const Rel *L, const Table *rt, const char *rq,
                       int lk, int rk, const Index *ix, JoinType type) {
     Rel out = {0};
     out.ncols = L->ncols + rt->col_count;
-    out.cols = malloc(out.ncols * sizeof(ColMeta));
+    out.cols = xmalloc(out.ncols * sizeof(ColMeta));
     for (size_t i = 0; i < L->ncols; i++) {
-        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
-        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+        out.cols[i].qualifier = L->cols[i].qualifier ? xstrdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = xstrdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
     }
     for (size_t i = 0; i < rt->col_count; i++) { size_t o = L->ncols + i;
-        out.cols[o].qualifier = rq ? strdup(rq) : NULL;
-        out.cols[o].name = strdup(rt->col_names[i]); out.cols[o].type = rt->col_types[i];
+        out.cols[o].qualifier = rq ? xstrdup(rq) : NULL;
+        out.cols[o].name = xstrdup(rt->col_names[i]); out.cols[o].type = rt->col_types[i];
     }
 
-    Row tmp; tmp.count = out.ncols; tmp.values = malloc(out.ncols * sizeof(Value));
+    Row tmp; tmp.count = out.ncols; tmp.values = xmalloc(out.ncols * sizeof(Value));
     for (size_t li = 0; li < L->nrows; li++) {
         for (size_t k = 0; k < L->ncols; k++) tmp.values[k] = L->rows[li].values[k];
         int matched = 0;
@@ -1700,13 +1804,13 @@ static Rel join_index(const Rel *L, const Table *rt, const char *rq,
                 int cmp; Value *rkey = &rt->rows[n->row].values[rk];
                 if (!value_compare(key, rkey, &cmp) || cmp != 0) continue;
                 for (size_t k = 0; k < rt->col_count; k++) tmp.values[L->ncols + k] = rt->rows[n->row].values[k];
-                Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+                Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
                 for (size_t k = 0; k < out.ncols; k++) row.values[k] = value_dup(&tmp.values[k]);
                 rel_add_row(&out, row); matched = 1;
             }
         }
         if (type == JOIN_LEFT && !matched) {
-            Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+            Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
             for (size_t k = 0; k < L->ncols; k++) row.values[k] = value_dup(&L->rows[li].values[k]);
             for (size_t k = 0; k < rt->col_count; k++) row.values[L->ncols + k].type = TYPE_NULL;
             rel_add_row(&out, row);
@@ -1723,7 +1827,7 @@ static Rel filter_rel(const Rel *in, const Expr *where) {
         int keep = is_true(eval_expr(where, in, &in->rows[i]));
         arena_reset();
         if (keep) {
-            Row row; row.count = in->ncols; row.values = malloc(row.count * sizeof(Value));
+            Row row; row.count = in->ncols; row.values = xmalloc(row.count * sizeof(Value));
             for (size_t j = 0; j < row.count; j++) row.values[j] = value_dup(&in->rows[i].values[j]);
             rel_add_row(&out, row);
         }
@@ -1781,16 +1885,16 @@ static void out_schema(const SelectStmt *s, const Rel *in, ColMeta **cols, size_
         SelItem *it = &s->items[i];
         if (it->kind == SEL_STAR) {
             for (size_t k = 0; k < in->ncols; k++) {
-                c = realloc(c, (n + 1) * sizeof(ColMeta));
-                c[n].qualifier = in->cols[k].qualifier ? strdup(in->cols[k].qualifier) : NULL;
-                c[n].name = strdup(in->cols[k].name); c[n].type = in->cols[k].type; n++;
+                c = xrealloc(c, (n + 1) * sizeof(ColMeta));
+                c[n].qualifier = in->cols[k].qualifier ? xstrdup(in->cols[k].qualifier) : NULL;
+                c[n].name = xstrdup(in->cols[k].name); c[n].type = in->cols[k].type; n++;
             }
         } else {
-            c = realloc(c, (n + 1) * sizeof(ColMeta));
+            c = xrealloc(c, (n + 1) * sizeof(ColMeta));
             const Expr *e = it->expr;
             /* keep the qualifier of a plain column so ORDER BY t.col resolves */
-            c[n].qualifier = (e->kind == EXPR_COLUMN && e->col.table) ? strdup(e->col.table) : NULL;
-            c[n].name = strdup(sel_name(it));
+            c[n].qualifier = (e->kind == EXPR_COLUMN && e->col.table) ? xstrdup(e->col.table) : NULL;
+            c[n].name = xstrdup(sel_name(it));
             c[n].type = expr_type(e, in); n++;
         }
     }
@@ -1802,7 +1906,7 @@ static Rel project_plain(const SelectStmt *s, const Rel *in) {
     Rel out = {0};
     out_schema(s, in, &out.cols, &out.ncols);
     for (size_t i = 0; i < in->nrows; i++) {
-        Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+        Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
         size_t vi = 0;
         EvalCtx cx = { in, &in->rows[i], NULL, 0, 0 };
         for (size_t k = 0; k < s->nitems; k++) {
@@ -1838,11 +1942,11 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
        A linear search over existing groups would be O(rows * groups) —
        catastrophic for high-cardinality keys — so we hash instead (~O(rows)). */
     Group *groups = NULL; size_t ng = 0, gcap = 0;
-    int *gidx = malloc(s->ngroup * sizeof(int));
+    int *gidx = xmalloc(s->ngroup * sizeof(int));
     for (size_t k = 0; k < s->ngroup; k++) gidx[k] = rel_find_col(in, &s->group[k]);
 
     size_t nb = 1024; while (nb < in->nrows) nb <<= 1;   /* power of two */
-    GNode **buckets = calloc(nb, sizeof(GNode *));
+    GNode **buckets = xcalloc(nb, sizeof(GNode *));
 
     for (size_t i = 0; i < in->nrows; i++) {
         unsigned long h = group_hash(&in->rows[i], gidx, s->ngroup);
@@ -1861,15 +1965,15 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
             if (same) { g = (long)n->gi; break; }
         }
         if (g < 0) {   /* new group */
-            if (ng == gcap) { gcap = gcap ? gcap * 2 : 16; groups = realloc(groups, gcap * sizeof(Group)); }
+            if (ng == gcap) { gcap = gcap ? gcap * 2 : 16; groups = xrealloc(groups, gcap * sizeof(Group)); }
             groups[ng].rows = NULL; groups[ng].nrows = 0; groups[ng].cap = 0;
-            GNode *node = malloc(sizeof(GNode));
+            GNode *node = xmalloc(sizeof(GNode));
             node->h = h; node->gi = ng; node->next = buckets[b]; buckets[b] = node;
             g = (long)ng++;
         }
         Group *grp = &groups[g];
         if (grp->nrows == grp->cap) { grp->cap = grp->cap ? grp->cap * 2 : 8;
-                                      grp->rows = realloc(grp->rows, grp->cap * sizeof(Row *)); }
+                                      grp->rows = xrealloc(grp->rows, grp->cap * sizeof(Row *)); }
         grp->rows[grp->nrows++] = &in->rows[i];
     }
     for (size_t b = 0; b < nb; b++)                      /* free the hash index */
@@ -1878,7 +1982,7 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
 
     /* Whole-table aggregate with no GROUP BY and no rows: still one group. */
     if (s->ngroup == 0 && ng == 0) {
-        groups = realloc(groups, sizeof(Group));
+        groups = xrealloc(groups, sizeof(Group));
         groups[0].rows = NULL; groups[0].nrows = 0; groups[0].cap = 0; ng = 1;
     }
 
@@ -1887,7 +1991,7 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
     for (size_t gi = 0; gi < ng; gi++) {
         Row **grows = groups[gi].rows; size_t gn = groups[gi].nrows;
         if (s->having) { int keep = is_true(eval_group(s->having, in, grows, gn)); arena_reset(); if (!keep) continue; }
-        Row row; row.count = out.ncols; row.values = malloc(out.ncols * sizeof(Value));
+        Row row; row.count = out.ncols; row.values = xmalloc(out.ncols * sizeof(Value));
         size_t vi = 0;
         EvalCtx cx = { in, gn ? grows[0] : NULL, grows, gn, 1 };
         for (size_t k = 0; k < s->nitems; k++) {
@@ -1912,15 +2016,15 @@ static Rel aggregate(const SelectStmt *s, const Rel *in) {
 static const Rel *g_ord_rel; static const OrderItem *g_ord; static size_t g_ord_n;
 /* Resolve an ORDER BY key to a column index in the (output) relation: a
  * positional `ORDER BY 2` uses column 2, otherwise resolve the column by name. */
-static int order_col_idx(const OrderItem *o) {
-    if (o->pos >= 1) return (o->pos - 1 < (long)g_ord_rel->ncols) ? (int)(o->pos - 1) : -1;
-    if (o->expr && o->expr->kind == EXPR_COLUMN) return rel_find_col(g_ord_rel, &o->expr->col);
+static int order_col_idx(const Rel *r, const OrderItem *o) {
+    if (o->pos >= 1) return (o->pos - 1 < (long)r->ncols) ? (int)(o->pos - 1) : -1;
+    if (o->expr && o->expr->kind == EXPR_COLUMN) return rel_find_col(r, &o->expr->col);
     return -1;
 }
 static int row_cmp(const void *pa, const void *pb) {
     const Row *ra = pa, *rb = pb;
     for (size_t k = 0; k < g_ord_n; k++) {
-        int idx = order_col_idx(&g_ord[k]);
+        int idx = order_col_idx(g_ord_rel, &g_ord[k]);
         if (idx < 0) continue;
         Value *a = &ra->values[idx], *b = &rb->values[idx];
         int c;
@@ -1933,6 +2037,7 @@ static int row_cmp(const void *pa, const void *pb) {
     return 0;
 }
 static void order_rel(Rel *r, const SelectStmt *s) {
+    if (r->nrows == 0) return;                        /* qsort(NULL,0,...) is UB */
     g_ord_rel = r; g_ord = s->order; g_ord_n = s->norder;
     qsort(r->rows, r->nrows, sizeof(Row), row_cmp);
 }
@@ -1951,7 +2056,7 @@ static int rows_equal(const Row *a, const Row *b, size_t ncols) {
 static void distinct_rel(Rel *r) {
     struct RNode { unsigned long h; size_t idx; struct RNode *next; } **buckets;
     size_t nb = 16; while (nb < r->nrows + 1) nb <<= 1;
-    buckets = calloc(nb, sizeof(void *));
+    buckets = xcalloc(nb, sizeof(void *));
     Row *keep = NULL; size_t nk = 0, kc = 0;
     for (size_t i = 0; i < r->nrows; i++) {
         unsigned long h = 1469598103934665603UL;
@@ -1967,8 +2072,8 @@ static void distinct_rel(Rel *r) {
                 if (r->rows[i].values[j].type == TYPE_STRING) free(r->rows[i].values[j].as.str_val);
             free(r->rows[i].values);
         } else {
-            if (nk == kc) { kc = kc ? kc * 2 : 16; keep = realloc(keep, kc * sizeof(Row)); }
-            struct RNode *nd = malloc(sizeof *nd); nd->h = h; nd->idx = nk; nd->next = buckets[b]; buckets[b] = nd;
+            if (nk == kc) { kc = kc ? kc * 2 : 16; keep = xrealloc(keep, kc * sizeof(Row)); }
+            struct RNode *nd = xmalloc(sizeof *nd); nd->h = h; nd->idx = nk; nd->next = buckets[b]; buckets[b] = nd;
             keep[nk++] = r->rows[i];
         }
     }
@@ -1996,7 +2101,7 @@ static void collect_conjuncts(const Expr *e, const Expr ***arr, size_t *n) {
         collect_conjuncts(e->left, arr, n);
         collect_conjuncts(e->right, arr, n);
     } else {
-        *arr = realloc(*arr, (*n + 1) * sizeof(Expr *));
+        *arr = xrealloc(*arr, (*n + 1) * sizeof(Expr *));
         (*arr)[(*n)++] = e;
     }
 }
@@ -2044,11 +2149,27 @@ static void expr_quals(const Expr *e, const char **set, int *n, int cap) {
  * repeatedly add the smallest table whose join predicate only references tables
  * already joined (so its ON clause still resolves). Otherwise we keep the
  * written order (LEFT joins aren't freely reorderable). */
+/* Does any column reference in the tree lack a table qualifier? */
+static int expr_has_unqualified_col(const Expr *e) {
+    if (!e) return 0;
+    if (e->kind == EXPR_COLUMN) return e->col.table == NULL;
+    if (expr_has_unqualified_col(e->left) || expr_has_unqualified_col(e->right) ||
+        expr_has_unqualified_col(e->lo) || expr_has_unqualified_col(e->hi)) return 1;
+    for (size_t i = 0; i < e->nargs; i++) if (expr_has_unqualified_col(e->args[i])) return 1;
+    return 0;
+}
+
 static void plan_join_order(Database *db, const SelectStmt *s, size_t *order) {
     size_t m = s->njoins;
-    int all_inner = 1;
-    for (size_t i = 0; i < m; i++) if (s->joins[i].type != JOIN_INNER) all_inner = 0;
-    if (!all_inner || m < 2) { for (size_t i = 0; i < m; i++) order[i] = i; return; }
+    /* Reordering is only SAFE when we can determine each join's dependencies:
+       all INNER, 2+ joins, small enough for the fixed node arrays, and every ON
+       clause fully qualified (an unqualified column could let us join a table
+       before its key exists -> silent wrong results). Otherwise keep the order
+       as written. */
+    int reorderable = (m >= 2) && (m + 1 <= 64);
+    for (size_t i = 0; i < m && reorderable; i++)
+        if (s->joins[i].type != JOIN_INNER || expr_has_unqualified_col(s->joins[i].on)) reorderable = 0;
+    if (!reorderable) { for (size_t i = 0; i < m; i++) order[i] = i; return; }
 
     /* node 0 = base (FROM); node k+1 = the table of join k */
     const char *nq[64]; nq[0] = s->from_alias ? s->from_alias : s->from_table;
@@ -2105,19 +2226,20 @@ static int indexable_pred(const Expr *e, Table *base, const char *bq,
  * BINDER (name resolution): before executing, resolve every column reference
  * against the query's schema and ERROR on anything unknown — otherwise a typo'd
  * column silently evaluates to NULL and the query "works" but returns nothing.
- * We build a permissive scope (all FROM+JOIN columns, plus SELECT aliases so
- * ORDER BY/HAVING can use them) to catch genuine typos without rejecting valid
- * queries.
+ * Scope = all FROM+JOIN columns. SELECT aliases are honored ONLY in ORDER BY
+ * (where the executor can resolve them, because output columns carry the alias
+ * name) — NOT in WHERE/HAVING/GROUP BY, where the executor can't resolve an
+ * alias and would silently produce NULL. So an alias used there errors loudly.
  * ========================================================================= */
 typedef struct { const char *qual; const char *name; } BCol;
-typedef struct { BCol *cols; size_t n, cap; const char **aliases; size_t na, nacap; } BindScope;
+typedef struct { BCol *cols; size_t n, cap; const char **aliases; size_t na, nacap; int allow_alias; } BindScope;
 
 static void bs_addcol(BindScope *sc, const char *q, const char *nm) {
-    if (sc->n == sc->cap) { sc->cap = sc->cap ? sc->cap * 2 : 16; sc->cols = realloc(sc->cols, sc->cap * sizeof(BCol)); }
+    if (sc->n == sc->cap) { sc->cap = sc->cap ? sc->cap * 2 : 16; sc->cols = xrealloc(sc->cols, sc->cap * sizeof(BCol)); }
     sc->cols[sc->n].qual = q; sc->cols[sc->n].name = nm; sc->n++;
 }
 static void bs_addalias(BindScope *sc, const char *a) {
-    if (sc->na == sc->nacap) { sc->nacap = sc->nacap ? sc->nacap * 2 : 8; sc->aliases = realloc(sc->aliases, sc->nacap * sizeof(char *)); }
+    if (sc->na == sc->nacap) { sc->nacap = sc->nacap ? sc->nacap * 2 : 8; sc->aliases = xrealloc(sc->aliases, sc->nacap * sizeof(char *)); }
     sc->aliases[sc->na++] = a;
 }
 static int bs_addtable(BindScope *sc, Database *db, const char *tbl, const char *alias) {
@@ -2141,7 +2263,8 @@ static int scope_resolve(const BindScope *sc, const ColRef *c) {
     int m = 0;                                        /* unqualified */
     for (size_t i = 0; i < sc->n; i++) if (strcmp(sc->cols[i].name, c->column) == 0) m++;
     if (m == 1) return 1;
-    if (m == 0) { for (size_t i = 0; i < sc->na; i++) if (strcmp(sc->aliases[i], c->column) == 0) return 1; }
+    if (m == 0 && sc->allow_alias)                    /* aliases resolve only in ORDER BY */
+        for (size_t i = 0; i < sc->na; i++) if (strcmp(sc->aliases[i], c->column) == 0) return 1;
     if (m > 1) fprintf(stderr, "bind error: ambiguous column: %s\n", c->column);
     else       fprintf(stderr, "bind error: no such column: %s\n", c->column);
     return 0;
@@ -2162,11 +2285,13 @@ static int bind_select(Database *db, const SelectStmt *s) {
     if (!ok) goto done;
     for (size_t i = 0; i < s->nitems; i++) if (s->items[i].alias) bs_addalias(&sc, s->items[i].alias);
 
+    sc.allow_alias = 0;   /* aliases NOT visible in JOIN/WHERE/GROUP/SELECT/HAVING */
     for (size_t i = 0; i < s->njoins && ok; i++) ok = bind_expr(&sc, s->joins[i].on);
     if (ok && s->where) ok = bind_expr(&sc, s->where);
     for (size_t i = 0; i < s->ngroup && ok; i++) ok = scope_resolve(&sc, &s->group[i]);
     for (size_t i = 0; i < s->nitems && ok; i++) if (s->items[i].kind == SEL_EXPR) ok = bind_expr(&sc, s->items[i].expr);
     if (ok && s->having) ok = bind_expr(&sc, s->having);
+    sc.allow_alias = 1;   /* ORDER BY may reference SELECT aliases */
     for (size_t i = 0; i < s->norder && ok; i++) if (s->order[i].pos < 0) ok = bind_expr(&sc, s->order[i].expr);
 done:
     free(sc.cols); free(sc.aliases);
@@ -2182,7 +2307,7 @@ static int execute_select(Database *db, const SelectStmt *s, Rel *result) {
        down to filter a relation BEFORE joining (smaller intermediate results). */
     const Expr **conj = NULL; size_t nconj = 0;
     if (s->where) collect_conjuncts(s->where, &conj, &nconj);
-    char *pushed = calloc(nconj ? nconj : 1, 1);
+    char *pushed = xcalloc(nconj ? nconj : 1, 1);
 
     const char *bq = s->from_alias ? s->from_alias : s->from_table;
 
@@ -2219,7 +2344,7 @@ static int execute_select(Database *db, const SelectStmt *s, Rel *result) {
         }
     }
 
-    size_t *order = malloc((s->njoins ? s->njoins : 1) * sizeof(size_t));
+    size_t *order = xmalloc((s->njoins ? s->njoins : 1) * sizeof(size_t));
     plan_join_order(db, s, order);
     for (size_t oi = 0; oi < s->njoins; oi++) {
         size_t i = order[oi];
@@ -2284,7 +2409,17 @@ static int execute_select(Database *db, const SelectStmt *s, Rel *result) {
     rel_free(&cur);
 
     if (s->distinct) distinct_rel(&out);
-    if (s->norder) order_rel(&out, s);
+    if (s->norder) {
+        /* every ORDER BY term must be an output column/position — we can't sort
+           by a column that projection already dropped. Error loudly rather than
+           silently ignore it. */
+        for (size_t k = 0; k < s->norder; k++)
+            if (order_col_idx(&out, &s->order[k]) < 0) {
+                fprintf(stderr, "error: ORDER BY term %zu is not a selected column or valid position\n", k + 1);
+                rel_free(&out); return 0;
+            }
+        order_rel(&out, s);
+    }
     if (s->limit >= 0 && (size_t)s->limit < out.nrows) {
         for (size_t i = s->limit; i < out.nrows; i++) {
             for (size_t j = 0; j < out.rows[i].count; j++)
@@ -2300,7 +2435,7 @@ static int execute_select(Database *db, const SelectStmt *s, Rel *result) {
 /* Print a result relation as an aligned grid. */
 static void rel_print(const Rel *r) {
     char buf[512];
-    size_t *w = malloc(r->ncols * sizeof(size_t));
+    size_t *w = xmalloc(r->ncols * sizeof(size_t));
     for (size_t c = 0; c < r->ncols; c++) {
         w[c] = strlen(r->cols[c].name);
         size_t tl = strlen(type_name(r->cols[c].type)); if (tl > w[c]) w[c] = tl;
@@ -2333,22 +2468,22 @@ static void rel_print(const Rel *r) {
  * per join (hash vs nested-loop), pushed-down filters, and a rough cost.
  * ========================================================================= */
 static Rel rel_schema_only(const Table *t, const char *qual) {
-    Rel r = {0}; r.ncols = t->col_count; r.cols = malloc(r.ncols * sizeof(ColMeta));
+    Rel r = {0}; r.ncols = t->col_count; r.cols = xmalloc(r.ncols * sizeof(ColMeta));
     for (size_t i = 0; i < r.ncols; i++) {
-        r.cols[i].qualifier = qual ? strdup(qual) : NULL;
-        r.cols[i].name = strdup(t->col_names[i]); r.cols[i].type = t->col_types[i];
+        r.cols[i].qualifier = qual ? xstrdup(qual) : NULL;
+        r.cols[i].name = xstrdup(t->col_names[i]); r.cols[i].type = t->col_types[i];
     }
     return r;   /* no rows: planning only needs the schema */
 }
 static Rel rel_combine_schema(const Rel *L, const Rel *R) {
-    Rel out = {0}; out.ncols = L->ncols + R->ncols; out.cols = malloc(out.ncols * sizeof(ColMeta));
+    Rel out = {0}; out.ncols = L->ncols + R->ncols; out.cols = xmalloc(out.ncols * sizeof(ColMeta));
     for (size_t i = 0; i < L->ncols; i++) {
-        out.cols[i].qualifier = L->cols[i].qualifier ? strdup(L->cols[i].qualifier) : NULL;
-        out.cols[i].name = strdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
+        out.cols[i].qualifier = L->cols[i].qualifier ? xstrdup(L->cols[i].qualifier) : NULL;
+        out.cols[i].name = xstrdup(L->cols[i].name); out.cols[i].type = L->cols[i].type;
     }
     for (size_t i = 0; i < R->ncols; i++) { size_t o = L->ncols + i;
-        out.cols[o].qualifier = R->cols[i].qualifier ? strdup(R->cols[i].qualifier) : NULL;
-        out.cols[o].name = strdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
+        out.cols[o].qualifier = R->cols[i].qualifier ? xstrdup(R->cols[i].qualifier) : NULL;
+        out.cols[o].name = xstrdup(R->cols[i].name); out.cols[o].type = R->cols[i].type;
     }
     return out;
 }
@@ -2358,7 +2493,7 @@ static void explain_select(Database *db, const SelectStmt *s) {
     if (!base) { fprintf(stderr, "no such table: %s\n", s->from_table); return; }
     const Expr **conj = NULL; size_t nconj = 0;
     if (s->where) collect_conjuncts(s->where, &conj, &nconj);
-    char *pushed = calloc(nconj ? nconj : 1, 1);
+    char *pushed = xcalloc(nconj ? nconj : 1, 1);
 
     const char *bq = s->from_alias ? s->from_alias : s->from_table;
     Rel cur = rel_schema_only(base, bq);
@@ -2368,7 +2503,7 @@ static void explain_select(Database *db, const SelectStmt *s) {
     for (size_t c = 0; c < nconj; c++) { int n; const char *q = expr_single_qualifier(conj[c], &n);
         if (n > 0 && q && strcmp(q, bq) == 0) { printf("    +push filter onto %s\n", bq); pushed[c] = 1; est *= 0.5; } }
 
-    size_t *order = malloc((s->njoins ? s->njoins : 1) * sizeof(size_t));
+    size_t *order = xmalloc((s->njoins ? s->njoins : 1) * sizeof(size_t));
     plan_join_order(db, s, order);
     for (size_t oi = 0; oi < s->njoins; oi++) {
         size_t i = order[oi];
@@ -2411,8 +2546,8 @@ static void db_add(Database *db, const char *name, Table t) {
             db->items[i].table = t;
             return;
         }
-    db->items = realloc(db->items, (db->count + 1) * sizeof(NamedTable));
-    db->items[db->count].name = strdup(name);
+    db->items = xrealloc(db->items, (db->count + 1) * sizeof(NamedTable));
+    db->items[db->count].name = xstrdup(name);
     db->items[db->count].table = t;
     db->count++;
 }
@@ -2488,7 +2623,9 @@ static void meta_command(Database *db, char *line) {
         int ci = -1;
         for (size_t i = 0; i < t->col_count; i++) if (strcmp(t->col_names[i], cn) == 0) ci = (int)i;
         if (ci < 0) { fprintf(stderr, "no such column: %s\n", cn); return; }
-        IndexKind kind = (kn && strcmp(kn, "sorted") == 0) ? IDX_SORTED : IDX_HASH;
+        IndexKind kind = IDX_HASH;
+        if (kn && ci_equal(kn, "sorted")) kind = IDX_SORTED;
+        else if (kn && !ci_equal(kn, "hash")) { fprintf(stderr, "unknown index type: %s (use hash or sorted)\n", kn); return; }
         table_add_index(t, ci, kind);
         printf("built %s index on %s.%s\n", kind == IDX_SORTED ? "sorted" : "hash", tn, cn);
     } else if (strcmp(cmd, ".autoindex") == 0) {
