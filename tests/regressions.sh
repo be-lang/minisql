@@ -130,6 +130,11 @@ if [ "$gr4" = "2.57" ]; then pass=$((pass+1)); else echo "WRONG [round-float-dig
 gr5=$(printf ".load %s m\nSELECT ROUND('abc') FROM m;\n" "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
 if [ "$gr5" = "NULL" ]; then pass=$((pass+1)); else echo "WRONG [round-string-garbage]: got '$gr5' want NULL"; fail=$((fail+1)); fi
 
+# --- negative values that round to zero give +0, like sqlite ----------------
+gz1=$(printf '.load %s m\nSELECT ROUND(-0.25) FROM m;\n' "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
+gz2=$(printf '.load %s m\nSELECT ROUND(-0.125, 1) FROM m;\n' "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gz1" = "0" ] && [ "$gz2" = "-0.1" ]; then pass=$((pass+1)); else echo "WRONG [round-negzero]: got '$gz1'/'$gz2' want 0/-0.1"; fail=$((fail+1)); fi
+
 # --- NaN in a CSV becomes NULL (like sqlite), keeping index == scan ----------
 printf 'x\n5\nnan\n5\n' > "$tmp/nan.csv"
 gnn=$(printf '.load %s n\nSELECT COUNT(*) FROM n WHERE x IS NULL;\n' "$tmp/nan.csv" | "$BIN" 2>&1 | cell1)
@@ -137,6 +142,13 @@ if [ "$gnn" = "1" ]; then pass=$((pass+1)); else echo "WRONG [csv-nan-null]: got
 gns=$(printf '.load %s n\nSELECT COUNT(*) FROM n WHERE x = 5;\n' "$tmp/nan.csv" | "$BIN" 2>&1 | cell1)
 gni2=$(printf '.load %s n\n.index n x hash\nSELECT COUNT(*) FROM n WHERE x = 5;\n' "$tmp/nan.csv" | "$BIN" 2>&1 | cell1)
 if [ "$gns" = "2" ] && [ "$gni2" = "2" ]; then pass=$((pass+1)); else echo "WRONG [nan-index-vs-scan]: scan=$gns idx=$gni2 want 2/2"; fail=$((fail+1)); fi
+
+# --- computed NaN (inf - inf) becomes NULL, like sqlite ---------------------
+printf 'x\ninf\n-inf\n' > "$tmp/inf.csv"
+gcn=$(printf '.load %s i\nSELECT COUNT(*) FROM i WHERE x - x IS NULL;\n' "$tmp/inf.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gcn" = "2" ]; then pass=$((pass+1)); else echo "WRONG [computed-nan-null]: got '$gcn' want 2"; fail=$((fail+1)); fi
+gsn=$(printf '.load %s i\nSELECT SUM(x) FROM i;\n' "$tmp/inf.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gsn" = "NULL" ]; then pass=$((pass+1)); else echo "WRONG [sum-nan-null]: got '$gsn' want NULL"; fail=$((fail+1)); fi
 
 # --- .index kind is case-insensitive like every other keyword ---------------
 gik=$(printf '.load data/simple.csv s\n.index s id HASH\n' | "$BIN" 2>&1)

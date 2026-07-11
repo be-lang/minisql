@@ -1300,6 +1300,7 @@ static Value eval_func(const Expr *e, EvalCtx *cx) {
             rb[cut] = '\0';
             d = strtod(rb, NULL);
         }
+        if (d == 0) d = 0;                                         /* -0.25 rounds to +0, like sqlite */
         v.type = TYPE_FLOAT; v.as.float_val = d; return v;
     }
     if (ci_equal(fn, "trim")) {
@@ -1355,8 +1356,8 @@ static Value eval_agg_expr(const Expr *e, EvalCtx *cx) {
     switch (e->agg) {
         case TOK_COUNT: out.type = TYPE_INT; out.as.int_val = cnt; break;
         /* SUM/AVG of zero (non-NULL) inputs is NULL, not 0 — SQL semantics */
-        case TOK_SUM: if (cnt) { if (isflt || iovf) { out.type = TYPE_FLOAT; out.as.float_val = acc; } else { out.type = TYPE_INT; out.as.int_val = iacc; } } break;
-        case TOK_AVG: if (cnt) { out.type = TYPE_FLOAT; out.as.float_val = acc / cnt; } break;
+        case TOK_SUM: if (cnt && acc == acc) { if (isflt || iovf) { out.type = TYPE_FLOAT; out.as.float_val = acc; } else { out.type = TYPE_INT; out.as.int_val = iacc; } } break;
+        case TOK_AVG: if (cnt && acc == acc) { out.type = TYPE_FLOAT; out.as.float_val = acc / cnt; } break;
         case TOK_MIN: case TOK_MAX: out = best; break;
         default: break;
     }
@@ -1447,6 +1448,7 @@ static Value eval(const Expr *e, EvalCtx *cx) {
                     double r = e->op == TOK_PLUS ? x + y : e->op == TOK_MINUS ? x - y :
                                e->op == TOK_STAR ? x * y : (y != 0 ? x / y : 0);
                     if (e->op == TOK_SLASH && y == 0) return v;
+                    if (r != r) return v;              /* inf - inf etc: NaN -> NULL, like sqlite */
                     v.type = TYPE_FLOAT; v.as.float_val = r; return v;
                 }
                 long x = a.as.int_val, y = b.as.int_val, r;
