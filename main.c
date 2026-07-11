@@ -329,6 +329,9 @@ static Value make_value_from_string(const char *raw, ColumnType type) {
         case TYPE_FLOAT:
             v.type = TYPE_FLOAT;
             v.as.float_val = strtod(raw, NULL);
+            /* NaN breaks compare/hash consistency (it is not equal to itself),
+               so store it as NULL — exactly what sqlite does on insert. */
+            if (v.as.float_val != v.as.float_val) v.type = TYPE_NULL;
             break;
         default:                            /* STRING (or a NULL-typed column) */
             v.type = TYPE_STRING;
@@ -1253,17 +1256,50 @@ static Value eval_func(const Expr *e, EvalCtx *cx) {
         return v;
     }
     if (ci_equal(fn, "round")) {
-        if (a.type == TYPE_NULL) return v;
+        if (a.type != TYPE_INT && a.type != TYPE_FLOAT) return v;  /* strings: strict typing -> NULL */
         double d = a.type == TYPE_FLOAT ? a.as.float_val : (double)a.as.int_val;
-        int nd = 0; if (e->nargs > 1) { Value b = eval(e->args[1], cx); if (b.type == TYPE_INT) nd = (int)b.as.int_val; }
-        if (nd < 0) nd = 0;
-        if (nd > 30) nd = 30;                        /* clamp, like sqlite */
-        /* Match sqlite: 0 digits rounds half away from zero (when it fits in a
-           long); otherwise round via printf, which sees the TRUE binary value —
-           so ROUND(2.675, 2) is 2.67, because 2.675 is really 2.67499... */
-        if (nd == 0 && d >= 0 && d < 9223372036854774784.0)      d = (double)(long)(d + 0.5);
-        else if (nd == 0 && d < 0 && -d < 9223372036854774784.0) d = -(double)(long)(-d + 0.5);
-        else { char rb[400]; snprintf(rb, sizeof rb, "%.*f", nd, d); d = strtod(rb, NULL); }
+        int nd = 0;
+        if (e->nargs > 1) {
+            Value b = eval(e->args[1], cx);
+            if (b.type == TYPE_NULL) return v;                     /* sqlite: NULL digits -> NULL */
+            double bd = b.type == TYPE_INT ? (double)b.as.int_val :
+                        b.type == TYPE_FLOAT ? b.as.float_val : 0;
+            if (bd != bd) bd = 0;                                  /* NaN digits */
+            nd = bd < 0 ? 0 : bd > 30 ? 30 : (int)bd;              /* clamp, like sqlite */
+        }
+        if (d != d) return v;                                      /* computed NaN -> NULL */
+        double av = d < 0 ? -d : d;
+        if (av > 1.7e308) { v.type = TYPE_FLOAT; v.as.float_val = d; return v; }   /* +-inf */
+        if (nd == 0 && av < 9223372036854774784.0) {               /* < 2^63 - 1024: cast is safe */
+            double r = (double)(long)(av + 0.5);                   /* sqlite: binary half-away here */
+            d = d < 0 ? -r : r;
+        } else {
+            /* Round on the EXACT decimal expansion — %f prints it in full (a
+               double has < 1075 fractional digits, so %.1100f never rounds) —
+               truncating at nd digits, half away from zero. This matches
+               sqlite's dtoa ROUND: 2.675 (really 2.67499...) -> 2.67, but the
+               exact tie 0.125 -> 0.13. Scaling by 10^nd instead would re-round
+               through a double multiply and turn 2.675*100 into exactly 267.5. */
+            char rb[1536];
+            snprintf(rb, sizeof rb, "%.1100f", d);
+            char *dot = strchr(rb, '.');
+            int start = rb[0] == '-' ? 1 : 0;
+            int cut = (int)(dot - rb) + (nd ? nd + 1 : 0);         /* keep the dot only if nd > 0 */
+            if (dot[1 + nd] >= '5') {                              /* guard digit >= 5: round away */
+                int i;
+                for (i = cut - 1; i >= start; i--) {
+                    if (rb[i] == '.') continue;
+                    if (rb[i] < '9') { rb[i]++; break; }
+                    rb[i] = '0';
+                }
+                if (i < start) {                                   /* carry out of the top digit */
+                    memmove(rb + start + 1, rb + start, (size_t)(cut - start));
+                    rb[start] = '1'; cut++;
+                }
+            }
+            rb[cut] = '\0';
+            d = strtod(rb, NULL);
+        }
         v.type = TYPE_FLOAT; v.as.float_val = d; return v;
     }
     if (ci_equal(fn, "trim")) {

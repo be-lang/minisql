@@ -118,6 +118,26 @@ if [ $rc -eq 0 ] && grep -qF "nested too deeply" <<<"$gfa"; then pass=$((pass+1)
 gin=$(python3 -c "print('.load $tmp/one.csv one'); print('SELECT ' + '1 IN ('*20000 + '1' + ')'*20000 + ' FROM one;')" | "$BIN" 2>&1); rc=$?
 if [ $rc -eq 0 ] && grep -qF "nested too deeply" <<<"$gin"; then pass=$((pass+1)); else echo "WRONG [deep-in-list]: rc=$rc"; fail=$((fail+1)); fi
 
+# --- ROUND matches sqlite: decimal ties away from zero, NULL/float digits ---
+gr1=$(printf '.load %s m\nSELECT ROUND(0.125, 2) FROM m;\n' "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gr1" = "0.13" ]; then pass=$((pass+1)); else echo "WRONG [round-tie-n2]: got '$gr1' want 0.13"; fail=$((fail+1)); fi
+gr2=$(printf '.load %s m\nSELECT ROUND(0.25, 1) FROM m;\n' "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gr2" = "0.3" ]; then pass=$((pass+1)); else echo "WRONG [round-tie-n1]: got '$gr2' want 0.3"; fail=$((fail+1)); fi
+gr3=$(printf '.load %s m\nSELECT ROUND(1.5, NULL) FROM m;\n' "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gr3" = "NULL" ]; then pass=$((pass+1)); else echo "WRONG [round-null-digits]: got '$gr3' want NULL"; fail=$((fail+1)); fi
+gr4=$(printf '.load %s m\nSELECT ROUND(2.567, 2.0) FROM m;\n' "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gr4" = "2.57" ]; then pass=$((pass+1)); else echo "WRONG [round-float-digits]: got '$gr4' want 2.57"; fail=$((fail+1)); fi
+gr5=$(printf ".load %s m\nSELECT ROUND('abc') FROM m;\n" "$tmp/lmin.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gr5" = "NULL" ]; then pass=$((pass+1)); else echo "WRONG [round-string-garbage]: got '$gr5' want NULL"; fail=$((fail+1)); fi
+
+# --- NaN in a CSV becomes NULL (like sqlite), keeping index == scan ----------
+printf 'x\n5\nnan\n5\n' > "$tmp/nan.csv"
+gnn=$(printf '.load %s n\nSELECT COUNT(*) FROM n WHERE x IS NULL;\n' "$tmp/nan.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gnn" = "1" ]; then pass=$((pass+1)); else echo "WRONG [csv-nan-null]: got '$gnn' want 1"; fail=$((fail+1)); fi
+gns=$(printf '.load %s n\nSELECT COUNT(*) FROM n WHERE x = 5;\n' "$tmp/nan.csv" | "$BIN" 2>&1 | cell1)
+gni2=$(printf '.load %s n\n.index n x hash\nSELECT COUNT(*) FROM n WHERE x = 5;\n' "$tmp/nan.csv" | "$BIN" 2>&1 | cell1)
+if [ "$gns" = "2" ] && [ "$gni2" = "2" ]; then pass=$((pass+1)); else echo "WRONG [nan-index-vs-scan]: scan=$gns idx=$gni2 want 2/2"; fail=$((fail+1)); fi
+
 # --- .index kind is case-insensitive like every other keyword ---------------
 gik=$(printf '.load data/simple.csv s\n.index s id HASH\n' | "$BIN" 2>&1)
 if grep -qF "unknown index type" <<<"$gik"; then echo "WRONG [index-kind-case]: HASH rejected"; fail=$((fail+1)); else pass=$((pass+1)); fi
